@@ -1,3 +1,6 @@
+import json
+import logging
+
 from django.conf import settings
 from django.contrib.auth.views import logout as auth_logout
 from django.contrib import messages
@@ -5,28 +8,31 @@ from django.contrib.auth.decorators import login_required
 from django.contrib.auth.models import User
 from django.core.paginator import Paginator, EmptyPage, PageNotAnInteger
 from django.db import transaction
-from django.http import HttpResponseRedirect, Http404
+from django.http import HttpResponse, HttpResponseBadRequest, HttpResponseRedirect, Http404
 from django.shortcuts import get_object_or_404, render
 from django.utils import timezone
 from django.utils.safestring import mark_safe
-from django.views.decorators.cache import cache_page, never_cache
+from django.views.decorators.cache import cache_control, never_cache
+from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 
-from tower import ugettext as _
+from django.utils.translation import ugettext as _
+from raven.contrib.django.models import client
 from waffle.decorators import waffle_flag
 
 import mozillians.phonebook.forms as forms
 from mozillians.api.models import APIv2App
 from mozillians.common.decorators import allow_public, allow_unvouched
-from mozillians.common.helpers import redirect, urlparams
+from mozillians.common.templatetags.helpers import get_object_or_none, redirect, urlparams
 from mozillians.common.middleware import LOGIN_MESSAGE, GET_VOUCHED_MESSAGE
 from mozillians.common.urlresolvers import reverse
-from mozillians.groups.helpers import stringify_groups
 from mozillians.groups.models import Group
 from mozillians.phonebook.models import Invite
 from mozillians.phonebook.utils import redeem_invite
 from mozillians.users.managers import EMPLOYEES, MOZILLIANS, PUBLIC, PRIVILEGED
-from mozillians.users.models import ExternalAccount, UserProfile, UserProfileMappingType
+from mozillians.users.models import (AbuseReport, ExternalAccount, UserProfile,
+                                     UserProfileMappingType)
+from mozillians.users.tasks import check_spam_account, update_email_in_basket
 
 
 @allow_unvouched
@@ -94,6 +100,7 @@ def view_profile(request, username):
     privacy_mappings = {'anonymous': PUBLIC, 'mozillian': MOZILLIANS, 'employee': EMPLOYEES,
                         'privileged': PRIVILEGED, 'myself': None}
     privacy_level = None
+    abuse_form = None
 
     if (request.user.is_authenticated() and request.user.username == username):
         # own profile
@@ -128,6 +135,21 @@ def view_profile(request, username):
             profile.set_instance_privacy_level(
                 request.user.userprofile.privacy_level)
 
+        if (request.user.is_authenticated() and request.user.userprofile.is_vouched and
+                not profile.can_vouch):
+            abuse_report = get_object_or_none(AbuseReport, reporter=request.user.userprofile,
+                                              profile=profile)
+
+            if not abuse_report:
+                abuse_report = AbuseReport(reporter=request.user.userprofile, profile=profile)
+
+            abuse_form = forms.AbuseReportForm(request.POST or None, instance=abuse_report)
+            if abuse_form.is_valid():
+                abuse_form.save()
+                msg = _(u'Thanks for helping us improve mozillians.org!')
+                messages.info(request, msg)
+                return redirect('phonebook:profile_view', profile.user.username)
+
         if (request.user.is_authenticated() and profile.is_vouchable(request.user.userprofile)):
 
             vouch_form = forms.VouchForm(request.POST or None)
@@ -144,6 +166,7 @@ def view_profile(request, username):
     data['shown_user'] = profile.user
     data['profile'] = profile
     data['groups'] = profile.get_annotated_groups()
+    data['abuse_form'] = abuse_form
 
     # Only show pending groups if user is looking at their own profile,
     # or current user is a superuser
@@ -162,7 +185,6 @@ def edit_profile(request):
     user = User.objects.get(pk=request.user.id)
     profile = user.userprofile
     user_groups = profile.groups.all().order_by('name')
-    user_skills = stringify_groups(profile.skills.all().order_by('name'))
     emails = ExternalAccount.objects.filter(type=ExternalAccount.TYPE_EMAIL)
     accounts_qs = ExternalAccount.objects.exclude(type=ExternalAccount.TYPE_EMAIL)
 
@@ -206,8 +228,7 @@ def edit_profile(request):
     language_privacy_data = get_request_data('language_privacy_form')
     ctx['language_privacy_form'] = forms.LanguagesPrivacyForm(language_privacy_data,
                                                               instance=profile)
-    ctx['skills_form'] = forms.SkillsForm(get_request_data('skills_form'), instance=profile,
-                                          initial={'skills': user_skills})
+    ctx['skills_form'] = forms.SkillsForm(get_request_data('skills_form'), instance=profile)
     location_initial = {
         'saveregion': True if profile.geo_region else False,
         'savecity': True if profile.geo_city else False,
@@ -240,6 +261,20 @@ def edit_profile(request):
             old_username = request.user.username
             for f in curr_forms:
                 f.save()
+
+            # Spawn task to check for spam
+            if not profile.can_vouch:
+                params = {
+                    'instance_id': profile.id,
+                    'user_ip': request.META.get('REMOTE_ADDR'),
+                    'user_agent': request.META.get('HTTP_USER_AGENT'),
+                    'referrer': request.META.get('HTTP_REFERER'),
+                    'comment_author': profile.full_name,
+                    'comment_author_email': profile.email,
+                    'comment_content': profile.bio
+                }
+
+                check_spam_account.delay(**params)
 
             next_section = request.GET.get('next')
             next_url = urlparams(reverse('phonebook:profile_edit'), next_section)
@@ -311,6 +346,8 @@ def change_primary_email(request, email_pk):
     with transaction.atomic():
         user.save()
         alternate_email.save()
+    # Notify Basket about this change
+    update_email_in_basket.delay(primary_email, user.email)
 
     return redirect('phonebook:profile_edit')
 
@@ -341,14 +378,13 @@ def search(request):
     show_pagination = False
     form = forms.SearchForm(request.GET)
     groups = None
-    functional_areas = None
+    functional_areas = Group.get_functional_areas()
 
     if form.is_valid():
         query = form.cleaned_data.get('q', u'')
         limit = form.cleaned_data['limit']
         include_non_vouched = form.cleaned_data['include_non_vouched']
         page = request.GET.get('page', 1)
-        functional_areas = Group.get_functional_areas()
         public = not (request.user.is_authenticated() and
                       request.user.userprofile.is_vouched)
 
@@ -434,7 +470,7 @@ def betasearch(request):
 
 
 @allow_public
-@cache_page(60 * 60 * 168)  # 1 week.
+@cache_control(public=True, must_revalidate=True, max_age=3600 * 24 * 7)  # 1 week.
 def search_plugin(request):
     """Render an OpenSearch Plugin."""
     return render(request, 'phonebook/search_opensearch.xml',
@@ -566,3 +602,31 @@ def register(request):
                                      "Sign in and then you can create a profile."))
 
     return redirect('phonebook:home')
+
+
+@require_POST
+@csrf_exempt
+@allow_public
+def capture_csp_violation(request):
+    data = client.get_data_from_request(request)
+    data.update({
+        'level': logging.INFO,
+        'logger': 'CSP',
+    })
+    try:
+        csp_data = json.loads(request.body)
+    except ValueError:
+        # Cannot decode CSP violation data, ignore
+        return HttpResponseBadRequest('Invalid CSP Report')
+
+    try:
+        blocked_uri = csp_data['csp-report']['blocked-uri']
+    except KeyError:
+        # Incomplete CSP report
+        return HttpResponseBadRequest('Incomplete CSP Report')
+
+    client.captureMessage(
+        message='CSP Violation: {}'.format(blocked_uri),
+        data=data)
+
+    return HttpResponse('Captured CSP violation, thanks for reporting.')

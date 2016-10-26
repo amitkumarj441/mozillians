@@ -6,11 +6,10 @@ from django.conf import settings
 from django.contrib.auth.models import User
 from django.core.urlresolvers import reverse
 from django.db.models.query import QuerySet
-from django.test.utils import override_settings
+from django.test import override_settings
 from django.utils import unittest
 from django.utils.timezone import make_aware
 
-import basket
 import pytz
 from mock import Mock, call, patch
 from nose.tools import eq_, ok_
@@ -30,10 +29,11 @@ class SignaledFunctionsTests(TestCase):
         user = User.objects.create(email='foo@example.com', username='foobar')
         ok_(user.userprofile)
 
-    @patch('mozillians.users.models.update_basket_task.delay')
-    def test_update_basket_post_save(self, update_basket_mock):
+    @patch('mozillians.users.models.subscribe_user_to_basket.delay')
+    @override_settings(BASKET_VOUCHED_NEWSLETTER='foo')
+    def test_subscribe_to_basket_post_save(self, subscribe_user_mock):
         user = UserFactory.create()
-        update_basket_mock.assert_called_with(user.userprofile.id)
+        subscribe_user_mock.assert_called_with(user.userprofile.id, ['foo'])
 
     @patch('mozillians.users.models.index_objects.delay')
     @patch('mozillians.users.models.unindex_objects.delay')
@@ -78,12 +78,13 @@ class SignaledFunctionsTests(TestCase):
         vouchee = UserFactory.create(vouched=False)
         vouchee.userprofile.vouch(voucher.userprofile)
         voucher.delete()
-        vouch = Vouch.objects.get(vouchee=vouchee)
+        vouch = Vouch.objects.get(vouchee=vouchee.userprofile)
         eq_(vouch.voucher, None)
 
-    @patch('mozillians.users.models.update_basket_task.delay')
+    @patch('mozillians.users.models.subscribe_user_to_basket.delay')
+    @override_settings(BASKET_VOUCHED_NEWSLETTER='foo')
     @override_settings(CAN_VOUCH_THRESHOLD=1)
-    def test_vouch_is_vouched_gets_updated(self, update_basket_mock):
+    def test_vouch_is_vouched_gets_updated(self, subscribe_user_mock):
         voucher = UserFactory.create()
         unvouched = UserFactory.create(vouched=False)
 
@@ -93,9 +94,10 @@ class SignaledFunctionsTests(TestCase):
         # Reload from database
         unvouched = User.objects.get(pk=unvouched.id)
         eq_(unvouched.userprofile.is_vouched, True)
-        ok_(update_basket_mock.called_with(unvouched.userprofile.id))
+        ok_(subscribe_user_mock.called_with(unvouched.userprofile.id, ['foo']))
 
     @patch('mozillians.users.models.unsubscribe_from_basket_task.delay')
+    @override_settings(BASKET_VOUCHED_NEWSLETTER='foo')
     def test_unvouch_is_vouched_gets_updated(self, unsubscribe_from_basket_mock):
         vouched = UserFactory.create()
 
@@ -105,8 +107,7 @@ class SignaledFunctionsTests(TestCase):
         # Reload from database
         vouched = User.objects.get(pk=vouched.id)
         eq_(vouched.userprofile.is_vouched, False)
-        ok_(unsubscribe_from_basket_mock.called_with(vouched.userprofile.email,
-                                                     vouched.userprofile.basket_token))
+        ok_(unsubscribe_from_basket_mock.called_with(vouched.userprofile.email, ['foo']))
 
     @override_settings(CAN_VOUCH_THRESHOLD=5)
     def test_vouch_can_vouch_gets_updated(self):
@@ -575,39 +576,6 @@ class UserProfileTests(TestCase):
     def test_get_absolute_url(self):
         user = UserFactory.create()
         ok_(user.userprofile.get_absolute_url())
-
-    @patch.object(basket, 'lookup_user', autospec=basket.lookup_user)
-    def test_lookup_token_registered(self, mock_lookup_user):
-        # Lookup token for a user with registered email
-        # basket returns response with data, lookup_basket_token returns the token
-        user = User(email='fake@example.com')
-        profile = UserProfile(user=user)
-        mock_lookup_user.return_value = {'status': 'ok', 'token': 'FAKETOKEN'}
-        result = profile.lookup_basket_token()
-        eq_('FAKETOKEN', result)
-
-    @patch.object(basket, 'lookup_user', autospec=basket.lookup_user)
-    def test_lookup_token_unregistered(self, mock_lookup_user):
-        # Lookup token for a user with no registered email
-        # Basket raises unknown user exception, then lookup-token returns None
-        user = User(email='fake@example.com')
-        profile = UserProfile(user=user)
-        mock_lookup_user.side_effect = basket.BasketException(
-            code=basket.errors.BASKET_UNKNOWN_EMAIL)
-        result = profile.lookup_basket_token()
-        ok_(result is None)
-
-    @patch.object(basket, 'lookup_user', autospec=basket.lookup_user)
-    def test_lookup_token_exceptions(self, mock_lookup_user):
-        # If basket raises any exception other than BASKET_UNKNOWN_EMAIL when
-        # we call lookup_basket_token, lookup_basket_token passes it up the chain
-        class SomeException(Exception):
-            pass
-        user = User(email='fake@example.com')
-        profile = UserProfile(user=user)
-        mock_lookup_user.side_effect = SomeException
-        with self.assertRaises(SomeException):
-            profile.lookup_basket_token()
 
     def test_language_privacy_public(self):
         """Test that instance with level PUBLIC cannot access languages."""

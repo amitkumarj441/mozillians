@@ -1,6 +1,6 @@
 # This is an example settings_local.py file.
 # Copy it and add your local settings here.
-
+from . import base
 from .base import DATABASES
 
 # For absolute urls
@@ -13,6 +13,12 @@ SITE_URL = '%s%s:%d' % (PROTOCOL, DOMAIN, PORT)
 DATABASES['default']['NAME'] = 'mozillians'
 DATABASES['default']['USER'] = 'root'
 DATABASES['default']['PASSWORD'] = ''
+
+# Uncomment in order to use django-debug-toolbar
+# INSTALLED_APPS = base.INSTALLED_APPS + ('debug_toolbar',)
+# MIDDLEWARE_CLASSES = (('debug_toolbar.middleware.DebugToolbarMiddleware',) +
+#                      base.MIDDLEWARE_CLASSES)
+# INTERNAL_IPS = ('127.0.0.1',)
 
 # Serve Profile Photos from django
 UPLOAD_URL = '/media/uploads'
@@ -32,7 +38,10 @@ ADMINS = (
 
 MANAGERS = ADMINS
 
-DEBUG = TEMPLATE_DEBUG = True
+DEBUG = True
+from .base import TEMPLATES
+for backend in TEMPLATES:
+    backend['OPTIONS']['debug'] = DEBUG
 
 # ElasticSearch
 ES_DISABLED = False
@@ -41,6 +50,7 @@ ES_INDEXES = {'default': 'mozillians-dev',
               'public': 'mozillians-dev-public'}
 
 CELERY_ALWAYS_EAGER = True
+CELERY_EAGER_PROPAGATES_EXCEPTIONS = False
 JAVA_BIN = '/usr/bin/java'
 SESSION_COOKIE_SECURE = False
 
@@ -51,3 +61,33 @@ CACHES = {
     }
 }
 BROWSERID_AUDIENCES = None
+
+CSP_REPORT_ENABLE = False
+CSP_DEFAULT_SRC = base.CSP_DEFAULT_SRC + (
+    'http://*.mapbox.com',
+)
+CSP_FONT_SRC = base.CSP_FONT_SRC + (
+    'http://*.mozilla.net',
+    'http://*.mozilla.org',
+    'http://mozorg.cdn.mozilla.net',
+)
+CSP_IMG_SRC = base.CSP_IMG_SRC + (
+    'http://*.mozilla.net',
+    'http://*.mozilla.org',
+    'http://*.mapbox.com',
+)
+CSP_SCRIPT_SRC = base.CSP_SCRIPT_SRC + (
+    'http://*.mozilla.net',
+    'http://*.mozilla.org',
+    'http://*.mapbox.com',
+)
+CSP_STYLE_SRC = base.CSP_STYLE_SRC + (
+    'http://*.mozilla.net',
+    'http://*.mozilla.org',
+    'http://*.mapbox.com',
+)
+
+# Basket
+BASKET_URL = 'http://127.0.0.1'
+BASKET_API_KEY = 'basket_api_key'
+BASKET_MANAGERS = None  # or list of email addresses.

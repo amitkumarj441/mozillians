@@ -6,7 +6,7 @@ from django.test import Client
 
 from nose.tools import eq_, ok_
 
-from mozillians.common.helpers import urlparams
+from mozillians.common.templatetags.helpers import urlparams
 from mozillians.common.tests import TestCase, requires_login, requires_vouch
 from mozillians.groups.tests import GroupFactory, SkillFactory
 from mozillians.users.tests import UserFactory
@@ -28,7 +28,7 @@ class IndexTests(TestCase):
         with self.login(user_1) as client:
             response = client.get(self.url, follow=True)
         eq_(response.status_code, 200)
-        self.assertTemplateUsed(response, 'groups/index_groups.html')
+        self.assertJinja2TemplateUsed(response, 'groups/index_groups.html')
         eq_(set(response.context['groups'].paginator.object_list), set([group_1, group_2]))
 
         # Member counts
@@ -63,7 +63,7 @@ class IndexFunctionalAreasTests(TestCase):
         with self.login(user) as client:
             response = client.get(self.url, follow=True)
         eq_(response.status_code, 200)
-        self.assertTemplateUsed(response, 'groups/index_areas.html')
+        self.assertJinja2TemplateUsed(response, 'groups/index_areas.html')
         eq_(set(response.context['groups'].paginator.object_list),
             set([group_1]))
 
@@ -94,7 +94,7 @@ class IndexSkillsTests(TestCase):
         with self.login(user) as client:
             response = client.get(self.url, follow=True)
         eq_(response.status_code, 200)
-        self.assertTemplateUsed(response, 'groups/index_skills.html')
+        self.assertJinja2TemplateUsed(response, 'groups/index_skills.html')
         eq_(set(response.context['groups'].paginator.object_list),
             set([skill_1, skill_2]))
 
@@ -149,9 +149,9 @@ class SearchTests(TestCase):
         eq_(response.get('content-type'), 'application/json')
 
     def test_search_incomplete_profile(self):
-        user = UserFactory.create(vouched=False, userprofile={'full_name': ''})
+        user = UserFactory.create(vouched=True, userprofile={'full_name': ''})
         group = GroupFactory.create(visible=True)
-        url = urlparams(reverse('groups:search_skills'), term=group.name)
+        url = urlparams(reverse('groups:skills-autocomplete'), q=group.name)
         with self.login(user) as client:
             response = client.get(url, follow=True,
                                   **{'HTTP_X_REQUESTED_WITH': 'XMLHttpRequest'})
@@ -168,7 +168,7 @@ class SearchTests(TestCase):
         user = UserFactory.create()
         skill_1 = SkillFactory.create()
         SkillFactory.create()
-        url = urlparams(reverse('groups:search_skills'), term=skill_1.name)
+        url = urlparams(reverse('groups:skills-autocomplete'), q=skill_1.name)
         with self.login(user) as client:
             response = client.get(url, follow=True,
                                   **{'HTTP_X_REQUESTED_WITH': 'XMLHttpRequest'})
@@ -176,8 +176,8 @@ class SearchTests(TestCase):
         eq_(response.get('content-type'), 'application/json')
 
         data = json.loads(response.content)
-        eq_(len(data), 1, 'Non autocomplete skills are included in search')
-        eq_(data[0], skill_1.name)
+        eq_(len(data['results']), 1, 'Non autocomplete skills are included in search')
+        eq_(data['results'][0]['id'], skill_1.id)
 
     def test_search_no_ajax(self):
         user = UserFactory.create()

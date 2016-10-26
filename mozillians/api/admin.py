@@ -1,26 +1,36 @@
+from django import forms
 from django.contrib import admin
 
-import autocomplete_light
+from dal import autocomplete
 from import_export import fields
-from import_export.admin import ExportMixin
 from import_export.resources import ModelResource
 
-from models import APIApp, APIv2App
+from mozillians.api.models import APIApp, APIv2App
+from mozillians.common.mixins import MozilliansAdminExportMixin
+
+
+class APIForm(forms.ModelForm):
+    """Override admin form to provide autocompletion."""
+
+    class Meta:
+        model = APIApp
+        fields = '__all__'
+        widgets = {
+            'owner': autocomplete.ModelSelect2(url='users:users-autocomplete')
+        }
 
 
 class APIAppResource(ModelResource):
     """APIApp admin export resource."""
     email = fields.Field(attribute='owner__email')
 
-    class Meta:
-        model = APIApp
 
-
-class APIAppAdmin(ExportMixin, admin.ModelAdmin):
+class APIAppAdmin(MozilliansAdminExportMixin, admin.ModelAdmin):
     """APIApp Admin."""
 
     list_display = ['name', 'key', 'owner', 'owner_email', 'is_mozilla_app', 'is_active']
     list_filter = ['is_mozilla_app', 'is_active']
+    form = APIForm
 
     def owner_email(self, obj):
         return obj.owner.email
@@ -28,7 +38,6 @@ class APIAppAdmin(ExportMixin, admin.ModelAdmin):
     owner_email.admin_order_field = 'owner__email'
     owner_email.short_description = 'Email'
 
-    form = autocomplete_light.modelform_factory(APIApp)
     resource_class = APIAppResource
 
 admin.site.register(APIApp, APIAppAdmin)
@@ -42,7 +51,17 @@ class APIv2AppResource(ModelResource):
         model = APIv2App
 
 
-class APIv2AppAdmin(ExportMixin, admin.ModelAdmin):
+class APIv2AppForm(forms.ModelForm):
+
+    class Meta:
+        model = APIv2App
+        fields = ('__all__')
+        widgets = {
+            'owner': autocomplete.ModelSelect2(url='api-v2-autocomplete')
+        }
+
+
+class APIv2AppAdmin(MozilliansAdminExportMixin, admin.ModelAdmin):
     """APIv2App Admin."""
     list_display = ['name', 'owner', 'owner_email', 'privacy_level', 'enabled', 'last_used']
     list_filter = ['privacy_level', 'enabled']
@@ -55,7 +74,7 @@ class APIv2AppAdmin(ExportMixin, admin.ModelAdmin):
     owner_email.admin_order_field = 'owner__user__email'
     owner_email.short_description = 'Email'
 
-    form = autocomplete_light.modelform_factory(APIv2App)
+    form = APIv2AppForm
     resource_class = APIv2AppResource
 
     fieldsets = (

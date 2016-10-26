@@ -1,0 +1,94 @@
+{% extends "base.html" %}
+
+{% block page_title %}
+  {{ _('Settings') }}
+{% endblock %}
+{% block body_id %}edit-profile{% endblock %}
+
+{% block extrahead %}
+  <link href="https://api.tiles.mapbox.com/mapbox.js/v1.6.2/mapbox.css"
+        type="text/css" rel="stylesheet" media="screen" />
+  {{ registration_form.media.css }}
+{% endblock extrahead %}
+
+{% block content %}
+  {% if not forms_valid %}
+    <div class="alert alert-error">
+      {{ _('Please correct the errors below.') }}
+    </div>
+  {% endif %}
+
+  {% if not profile.is_complete %}
+    <div class="alert alert-info">
+      {% trans %}
+        You are just one step away from creating your profile.
+      {% endtrans %}
+    </div>
+  {% endif %}
+
+  {% if profile.is_complete %}
+    {# This is the full profile form for those who have completed registration. #}
+    <div class="row">
+      <div class="col-md-3 hidden-xs hidden-sm">
+        <div class="panel panel-default">
+          <div class="panel-heading">{{ _('Settings') }}</div>
+          <ul class="list-group settings-nav">
+            <li class="list-group-item" id="profile-li"><a href="#profile">{{ _('Profile') }}</a></li>
+            <li class="list-group-item" id="mylocation-li"><a href="#mylocation">{{ _('Location') }}</a></li>
+            <li class="list-group-item" id="youandmozilla-li"><a href="#youandmozilla">{{ _('You &amp; Mozilla') }}</a></li>
+            <li class="list-group-item" id="mygroups-li"><a href="#mygroups">{{ _('Groups') }}</a></li>
+            <li class="list-group-item" id="extaccounts-li"><a href="#extaccounts">{{ _('External Accounts') }}</a></li>
+            <li class="list-group-item" id="developer-li"><a href="#developer">{{ _('Developer') }}</a></li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="col-md-{% if profile.is_complete %}9{% else %}12{% endif %}">
+        <div class="settings-content">
+          <!-- Profle Tab -->
+          {% include 'phonebook/includes/profile_edit_basic.html' %}
+
+          <!-- Location Tab -->
+          {% include 'phonebook/includes/profile_edit_location.html' %}
+
+          <!-- You &amp; Mozilla -->
+          {% include 'phonebook/includes/profile_edit_you.html' %}
+
+          <!-- Groups -->
+          {% include 'phonebook/includes/profile_edit_groups.html' %}
+
+          <!-- External Accounts -->
+          {% include 'phonebook/includes/profile_edit_accounts.html' %}
+
+          <!-- Developer -->
+          {% include 'phonebook/includes/profile_edit_developer.html' %}
+
+          <div class="panel panel-info settings-all hidden-md hidden-lg">
+            <div class="panel-heading">
+              Show all Settings
+              <span class="glyphicon glyphicon-chevron-down" aria-hidden="true"></span>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </div>
+
+  {% else %}
+    {# This is the required-only profile form for new registrations. #}
+    {% include 'phonebook/includes/profile_edit_registration.html' %}
+  {% endif %}
+{% endblock %}
+
+{% block page_js %}
+  <script src="https://www.google.com/recaptcha/api.js" async defer></script>
+  <script src="https://api.tiles.mapbox.com/mapbox.js/v1.6.2/mapbox.js"></script>
+  {% compress js %}
+    <script src="{{ static('mozillians/js/libs/URI.js') }}"></script>
+    <script src="{{ static('mozillians/js/libs/tag-it/js/tag-it.js') }}"></script>
+    <script src="{{ static('mozillians/js/profile_edit.js') }}"></script>
+    <script src="{{ static('mozillians/js/profile_edit_mapbox.js') }}"></script>
+  {% endcompress %}
+  {{ registration_form.media.js }}
+  {{ skills_form.media }}
+{% endblock %}

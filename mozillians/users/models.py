@@ -14,15 +14,14 @@ from django.utils.http import urlquote
 from django.template.loader import get_template
 
 
-import basket
 from product_details import product_details
 from pytz import common_timezones
 from sorl.thumbnail import ImageField, get_thumbnail
-from tower import ugettext as _, ugettext_lazy as _lazy
+from django.utils.translation import ugettext as _, ugettext_lazy as _lazy
 
 from mozillians.common import utils
-from mozillians.common.helpers import absolutify, gravatar
-from mozillians.common.helpers import offset_of_timezone
+from mozillians.common.templatetags.helpers import absolutify, gravatar
+from mozillians.common.templatetags.helpers import offset_of_timezone
 from mozillians.common.urlresolvers import reverse
 from mozillians.groups.models import (Group, GroupAlias, GroupMembership,
                                       Skill, SkillAlias)
@@ -36,7 +35,7 @@ from mozillians.users.managers import (EMPLOYEES,
                                        PUBLIC, PUBLIC_INDEXABLE_FIELDS,
                                        UserProfileManager, UserProfileQuerySet)
 from mozillians.users.tasks import (index_objects, unsubscribe_from_basket_task,
-                                    update_basket_task, unindex_objects)
+                                    subscribe_user_to_basket, unindex_objects)
 
 
 COUNTRIES = product_details.get_regions('en-US')
@@ -63,6 +62,7 @@ class UserProfilePrivacyModel(models.Model):
 
     privacy_photo = PrivacyField()
     privacy_full_name = PrivacyField()
+    privacy_full_name_local = PrivacyField()
     privacy_ircname = PrivacyField()
     privacy_email = PrivacyField()
     privacy_bio = PrivacyField()
@@ -117,7 +117,7 @@ class UserProfilePrivacyModel(models.Model):
                 # Figure out a good default value for it (to show to users
                 # who aren't privileged to see the actual value)
                 if isinstance(field, ManyToManyField):
-                    default = field.related.parent_model.objects.none()
+                    default = field.related.model.objects.none()
                 else:
                     default = field.get_default()
                 privacy_fields[name] = default
@@ -140,13 +140,15 @@ class UserProfile(UserProfilePrivacyModel):
     user = models.OneToOneField(User)
     full_name = models.CharField(max_length=255, default='', blank=False,
                                  verbose_name=_lazy(u'Full Name'))
+    full_name_local = models.CharField(max_length=255, blank=True, default='',
+                                       verbose_name=_lazy(u'Name in local language'))
     is_vouched = models.BooleanField(
         default=False,
         help_text='You can edit vouched status by editing invidual vouches')
     can_vouch = models.BooleanField(
         default=False,
         help_text='You can edit can_vouch status by editing invidual vouches')
-    last_updated = models.DateTimeField(auto_now=True, default=datetime.now)
+    last_updated = models.DateTimeField(auto_now=True)
     groups = models.ManyToManyField(Group, blank=True, related_name='members',
                                     through=GroupMembership)
     skills = models.ManyToManyField(Skill, blank=True, related_name='members')
@@ -523,24 +525,6 @@ class UserProfile(UserProfilePrivacyModel):
         send_mail(subject, filtered_message, settings.FROM_NOREPLY,
                   [self.user.email])
 
-    def lookup_basket_token(self):
-        """
-        Query Basket for this user's token.  If Basket doesn't find the user,
-        returns None. If Basket does find the token, returns it. Otherwise,
-        there must have been some error from the network or basket, and this
-        method just lets that exception propagate so the caller can decide how
-        best to handle it.
-
-        (Does not update the token field on the UserProfile.)
-        """
-        try:
-            result = basket.lookup_user(email=self.user.email)
-        except basket.BasketException as exception:
-            if exception.code == basket.errors.BASKET_UNKNOWN_EMAIL:
-                return None
-            raise
-        return result['token']
-
     def get_annotated_groups(self):
         """
         Return a list of all the visible groups the user is a member of or pending
@@ -624,13 +608,13 @@ def create_user_profile(sender, instance, created, raw, **kwargs):
             dbsignals.post_save.send(sender=UserProfile, instance=up, created=created, raw=raw)
 
 
-@receiver(dbsignals.post_save, sender=UserProfile,
-          dispatch_uid='update_basket_sig')
+@receiver(dbsignals.post_save, sender=UserProfile, dispatch_uid='update_basket_sig')
 def update_basket(sender, instance, **kwargs):
+    newsletters = [settings.BASKET_VOUCHED_NEWSLETTER]
     if instance.is_vouched:
-        update_basket_task.delay(instance.id)
-    elif instance.basket_token:
-        unsubscribe_from_basket_task.delay(instance.email, instance.basket_token)
+        subscribe_user_to_basket.delay(instance.id, newsletters)
+    else:
+        unsubscribe_from_basket_task.delay(instance.email, newsletters)
 
 
 @receiver(dbsignals.post_save, sender=UserProfile,
@@ -651,14 +635,13 @@ def remove_from_search_index(sender, instance, **kwargs):
     unindex_objects.delay(UserProfileMappingType, [instance.id], public_index=True)
 
 
-@receiver(dbsignals.pre_delete, sender=UserProfile,
-          dispatch_uid='unsubscribe_from_basket_sig')
+@receiver(dbsignals.pre_delete, sender=UserProfile, dispatch_uid='unsubscribe_from_basket_sig')
 def unsubscribe_from_basket(sender, instance, **kwargs):
-    unsubscribe_from_basket_task.delay(instance.email, instance.basket_token)
+    newsletters = [settings.BASKET_VOUCHED_NEWSLETTER, settings.BASKET_NDA_NEWSLETTER]
+    unsubscribe_from_basket_task.delay(instance.email, newsletters)
 
 
-@receiver(dbsignals.post_delete, sender=UserProfile,
-          dispatch_uid='delete_user_obj_sig')
+@receiver(dbsignals.post_delete, sender=UserProfile, dispatch_uid='delete_user_obj_sig')
 def delete_user_obj_sig(sender, instance, **kwargs):
     if instance.user:
         instance.user.delete()
@@ -698,6 +681,23 @@ def update_vouch_flags(sender, instance, **kwargs):
     profile.is_vouched = vouches > 0
     profile.can_vouch = vouches >= settings.CAN_VOUCH_THRESHOLD
     profile.save(**{'autovouch': False})
+
+
+class AbuseReport(models.Model):
+    TYPE_SPAM = 'spam'
+    TYPE_INAPPROPRIATE = 'inappropriate'
+
+    REPORT_TYPES = (
+        (TYPE_SPAM, 'Spam profile'),
+        (TYPE_INAPPROPRIATE, 'Inappropriate content')
+    )
+
+    reporter = models.ForeignKey(UserProfile, related_name='abuses_reported', null=True)
+    profile = models.ForeignKey(UserProfile, related_name='abuses')
+    type = models.CharField(choices=REPORT_TYPES, max_length=30, blank=False, default='')
+    is_akismet = models.BooleanField(default=False)
+    created = models.DateTimeField(auto_now_add=True)
+    updated = models.DateTimeField(auto_now=True)
 
 
 class UsernameBlacklist(models.Model):

@@ -1,20 +1,20 @@
 from datetime import datetime
 
-from django.conf import settings
 from django.contrib.auth.models import User
 from django.test.utils import override_settings
 
+from basket.base import BasketException
+from celery.exceptions import Retry
 from elasticsearch.exceptions import NotFoundError
 from mock import MagicMock, Mock, call, patch
 from nose.tools import eq_, ok_
 
 from mozillians.common.tests import TestCase
-from mozillians.groups.tests import GroupFactory
 from mozillians.users.managers import PUBLIC
-from mozillians.users.models import UserProfile
-from mozillians.users.tasks import (_email_basket_managers, index_objects,
-                                    remove_incomplete_accounts, unindex_objects,
-                                    unsubscribe_from_basket_task)
+from mozillians.users.tasks import (index_objects, lookup_user_task, remove_incomplete_accounts,
+                                    subscribe_user_task, subscribe_user_to_basket,
+                                    unindex_objects, unsubscribe_from_basket_task,
+                                    unsubscribe_user_task, update_email_in_basket)
 from mozillians.users.tests import UserFactory
 
 
@@ -101,120 +101,236 @@ class ElasticSearchIndexTests(TestCase):
 
 
 class BasketTests(TestCase):
-    @override_settings(BASKET_MANAGERS=False)
-    @patch('mozillians.users.tasks.send_mail')
-    def test_email_basket_managers_email_not_set(self, send_mail_mock):
-        _email_basket_managers('foo', 'bar', 'error')
-        ok_(not send_mail_mock.called)
 
-    @override_settings(BASKET_MANAGERS='basket_managers',
-                       FROM_NOREPLY='noreply')
-    @patch('mozillians.users.tasks.send_mail')
-    def test_email_basket_managers(self, send_mail_mock):
-        subject = '[Mozillians - ET] Failed to subscribe or update user bar'
-        body = """
-    Something terrible happened while trying to subscribe user bar from Basket.
-
-    Here is the error message:
-
-    error
-    """
-        _email_basket_managers('subscribe', 'bar', 'error')
-        send_mail_mock.assert_called_with(
-            subject, body, 'noreply', 'basket_managers', fail_silently=False)
-
-    @override_settings(BASKET_NEWSLETTER='newsletter')
+    @override_settings(CELERY_ALWAYS_EAGER=True)
     @patch('mozillians.users.tasks.BASKET_ENABLED', True)
+    @patch('mozillians.users.tasks.waffle.switch_is_active')
+    @patch('mozillians.users.tasks.unsubscribe_user_task')
+    @patch('mozillians.users.tasks.subscribe_user_task')
+    @patch('mozillians.users.tasks.lookup_user_task')
     @patch('mozillians.users.tasks.basket')
-    def test_update_basket_task(self, mock_basket):
-        # When a user is created or added to a group, the appropriate
-        # calls to update basket are made
-        email = 'foo@example.com'
-        token = 'footoken'
-        mock_basket.lookup_user.return_value = {
-            'email': email,
-        }
-        mock_basket.subscribe.return_value = {
-            'token': token,
-        }
-        user = UserFactory.create(email=email)
-        mock_basket.subscribe.reset_mock()  # forget that subscribe was called
-        group = GroupFactory.create(name='Web Development',
-                                    functional_area=True)
-        GroupFactory.create(name='Marketing', functional_area=True)
-        data = {'country': 'gr',
-                'city': 'Athens',
-                'WEB_DEVELOPMENT': 'Y',
-                'MARKETING': 'N'}
-
-        group.add_member(user.userprofile)
-
-        # We just added a group, we should not need to subscribe anything
-        ok_(not mock_basket.subscribe.called)
-        # But we do need to update their phonebook record
-        mock_basket.request.assert_called_with(
-            'post', 'custom_update_phonebook', token=token, data=data)
-
-    @override_settings(BASKET_NEWSLETTER='newsletter')
-    @patch('mozillians.users.tasks.BASKET_ENABLED', True)
-    @patch('mozillians.users.tasks.basket')
-    def test_change_email(self, mock_basket):
-        # When a user's email is changed, their old email is unsubscribed
-        # from all newsletters and their new email is subscribed to them.
+    def test_change_email(self, basket_mock, lookup_mock, subscribe_mock, unsubscribe_mock,
+                          switch_is_active_mock):
 
         # Create a new user
-        email = 'foo@example.com'
-        token = 'first token'
-        mock_basket.lookup_user.return_value = {
-            'email': email,  # the old value
-            'token': token,
+        old_email = 'foo@example.com'
+        # We need vouched=False in order to avoid triggering a basket_update through signals.
+        user = UserFactory.create(email=old_email, vouched=False)
+        new_email = 'bar@example.com'
+
+        # Enable basket.
+        switch_is_active_mock.return_value = True
+
+        # Mock all the calls to basket.
+        basket_mock.lookup_user.return_value = {
+            'email': old_email,  # the old value
             'newsletters': ['foo', 'bar']
         }
-        mock_basket.subscribe.return_value = {
-            'token': token,
+        basket_mock.unsubscribe.return_value = {
+            'result': 'ok',
         }
-        user = UserFactory.create(email=email)
-        up = UserProfile.objects.get(pk=user.userprofile.pk)
-        eq_(token, up.basket_token)
-
-        new_email = 'bar@example.com'
-        new_token = 'NEW token'
-        mock_basket.subscribe.return_value = {
-            'token': new_token,
+        basket_mock.subscribe.return_value = {
+            'token': 'new token',
         }
-        user.email = new_email
-        user.save()
-        mock_basket.lookup_user.assert_called_with(token=token)
-        mock_basket.unsubscribe.assert_called_with(
-            token=token, email=email, optout='Y', newsletters=[settings.BASKET_NEWSLETTER]
-        )
-        mock_basket.subscribe.assert_called_with(
-            new_email,
-            [settings.BASKET_NEWSLETTER],
-            trigger_welcome='N',
-            sync='Y'
-        )
-        up = UserProfile.objects.get(pk=user.userprofile.pk)
-        eq_(new_token, up.basket_token)
 
-    @override_settings(BASKET_NEWSLETTER='newsletter')
-    @patch('mozillians.users.tasks.basket.unsubscribe')
-    def test_unsubscribe_from_basket_task(self, unsubscribe_mock):
-        user = UserFactory.create(userprofile={'basket_token': 'foo'})
-        with patch('mozillians.users.tasks.BASKET_ENABLED', True):
-            unsubscribe_from_basket_task(user.email, user.userprofile.basket_token)
-        unsubscribe_mock.assert_called_with(
-            user.userprofile.basket_token, user.email, newsletters='newsletter')
+        lookup_mock.reset_mock()
+        subscribe_mock.reset_mock()
+        unsubscribe_mock.reset_mock()
 
-    @override_settings(BASKET_NEWSLETTER='newsletter')
+        # When a user's email is changed, their old email is unsubscribed
+        # from all newsletters related to mozillians.org and their new email is subscribed to them.
+        update_email_in_basket(user.email, new_email)
+
+        # Verify subtask calls and call count
+        ok_(lookup_mock.subtask.called)
+        eq_(lookup_mock.subtask.call_count, 1)
+        ok_(subscribe_mock.subtask.called)
+        eq_(subscribe_mock.subtask.call_count, 1)
+        ok_(unsubscribe_mock.subtask.called)
+        eq_(unsubscribe_mock.subtask.call_count, 1)
+
+        # Verify call arguments
+        lookup_mock.subtask.assert_called_with((user.email,))
+        unsubscribe_mock.subtask.called_with(({'token': 'new token',
+                                               'email': 'foo@example.com',
+                                               'newsletters': ['foo', 'bar']},))
+        subscribe_mock.subtask.called_with(('bar@example.com',))
+
+    @patch('mozillians.users.tasks.waffle.switch_is_active')
+    @patch('mozillians.users.tasks.unsubscribe_user_task')
+    @patch('mozillians.users.tasks.lookup_user_task')
     @patch('mozillians.users.tasks.basket')
-    @patch.object(UserProfile, 'lookup_basket_token')
-    def test_unsubscribe_from_basket_task_without_token(self, lookup_token_mock, basket_mock):
-        lookup_token_mock.return_value = 'basket_token'
-        basket_mock.lookup_user.return_value = {'token': 'basket_token'}
-        user = UserFactory.create(userprofile={'basket_token': ''})
+    def test_unsubscribe_from_basket_task(self, basket_mock, lookup_mock, unsubscribe_mock,
+                                          switch_is_active_mock):
+        switch_is_active_mock.return_value = True
+        user = UserFactory.create(email='foo@example.com')
+        basket_mock.lookup_user.return_value = {
+            'email': user.email,  # the old value
+            'token': 'token',
+            'newsletters': ['foo', 'bar']
+        }
+
+        lookup_mock.reset_mock()
+        unsubscribe_mock.reset_mock()
+
         with patch('mozillians.users.tasks.BASKET_ENABLED', True):
-            unsubscribe_from_basket_task(user.email, user.userprofile.basket_token)
-        user = User.objects.get(pk=user.pk)  # refresh data from DB
-        basket_mock.unsubscribe.assert_called_with(
-            'basket_token', user.email, newsletters='newsletter')
+            unsubscribe_from_basket_task(user.email, ['foo'])
+        eq_(lookup_mock.subtask.call_count, 1)
+        eq_(unsubscribe_mock.subtask.call_count, 1)
+        lookup_mock.subtask.assert_called_with((user.email,))
+        unsubscribe_mock.subtask.called_with((['foo'],))
+
+    @override_settings(CELERY_ALWAYS_EAGER=True)
+    @patch('mozillians.users.tasks.BASKET_ENABLED', True)
+    @patch('mozillians.users.tasks.waffle.switch_is_active')
+    @patch('mozillians.users.tasks.subscribe_user_task.subtask')
+    @patch('mozillians.users.tasks.lookup_user_task.subtask')
+    def test_subscribe_no_newsletters(self, lookup_mock, subscribe_mock, switch_is_active_mock):
+        switch_is_active_mock.return_value = True
+        user = UserFactory.create(vouched=False)
+        result = subscribe_user_to_basket.delay(user.userprofile.pk)
+        ok_(lookup_mock.called)
+        ok_(not subscribe_mock.called)
+        ok_(not result.get())
+
+    @patch('mozillians.users.tasks.basket.lookup_user')
+    def test_lookup_task_user_not_found(self, lookup_mock):
+
+        lookup_mock.side_effect = BasketException(u'User not found')
+        result = lookup_user_task(email='foo@example.com')
+        eq_(result, {})
+
+    @patch('mozillians.users.tasks.lookup_user_task.retry')
+    @patch('mozillians.users.tasks.basket.lookup_user')
+    def test_lookup_task_basket_error(self, lookup_mock, retry_mock):
+
+        exc = BasketException(u'Error error error')
+        lookup_mock.side_effect = [exc, None]
+        retry_mock.side_effect = Retry
+        with self.assertRaises(Retry):
+            lookup_user_task(email='foo@example.com')
+        retry_mock.called_with(exc)
+
+    def test_subscribe_user_task_no_result_no_email(self):
+        ok_(not subscribe_user_task(result={}, email=''))
+
+    @patch('mozillians.users.tasks.basket.subscribe')
+    def test_subscribe_user_task_no_email_no_newsletters(self, subscribe_mock):
+        result = {
+            'status': 'ok',
+            'newsletters': ['foo', 'bar', 'mozilla-phone'],
+            'email': 'result_email@example.com'
+        }
+
+        subscribe_user_task(result=result, email=None)
+        subscribe_mock.assert_called_with('result_email@example.com', ['mozilla-phone'],
+                                          sync='N', trigger_welcome='N',
+                                          api_key='basket_api_key')
+
+    @patch('mozillians.users.tasks.basket.subscribe')
+    def test_subscribe_user_task_no_newsletters(self, subscribe_mock):
+        result = {
+            'status': 'ok',
+            'newsletters': ['foo', 'bar'],
+            'email': 'result_email@example.com'
+        }
+
+        subscribe_user_task(result=result, email='foo@xample.com')
+        subscribe_mock.assert_not_called()
+
+    @patch('mozillians.users.tasks.basket.subscribe')
+    def test_subscribe_user_task(self, subscribe_mock):
+        result = {
+            'status': 'ok',
+            'newsletters': ['foo', 'bar'],
+            'email': 'result_email@example.com'
+        }
+        kwargs = {
+            'result': result,
+            'email': 'foo@example.com',
+            'newsletters': ['foobar', 'foo']
+        }
+        subscribe_user_task(**kwargs)
+        subscribe_mock.assert_called_with('foo@example.com', ['foobar'],
+                                          sync='N', trigger_welcome='N',
+                                          api_key='basket_api_key')
+
+    @patch('mozillians.users.tasks.basket.subscribe')
+    def test_subscribe_user_task_no_result(self, subscribe_mock):
+        kwargs = {
+            'result': {'status': 'error',
+                       'desc': u'User not found'},
+            'email': 'foo@example.com',
+            'newsletters': ['mozilla-phone']
+        }
+        subscribe_user_task(**kwargs)
+        subscribe_mock.assert_called_with('foo@example.com', ['mozilla-phone'],
+                                          sync='N', trigger_welcome='N',
+                                          api_key='basket_api_key')
+
+    @patch('mozillians.users.tasks.subscribe_user_task.retry')
+    @patch('mozillians.users.tasks.basket.subscribe')
+    def test_subscribe_user_basket_error(self, subscribe_mock, retry_mock):
+        result = {
+            'status': 'ok',
+            'newsletters': ['foo', 'bar'],
+            'email': 'result_email@example.com'
+        }
+        kwargs = {
+            'result': result,
+            'email': 'foo@example.com',
+            'newsletters': ['foobar', 'foo']
+        }
+
+        exc = BasketException(u'Error error error')
+        subscribe_mock.side_effect = [exc, None]
+        retry_mock.side_effect = Retry
+        with self.assertRaises(Retry):
+            subscribe_user_task(**kwargs)
+        retry_mock.called_with(exc)
+
+    def test_unsubscribe_user_no_result(self):
+        ok_(not unsubscribe_user_task(result={}))
+
+    @patch('mozillians.users.tasks.basket.unsubscribe')
+    def test_unsubscribe_user_task_success_no_newsletters(self, unsubscribe_mock):
+        result = {
+            'status': 'ok',
+            'newsletters': ['foo', 'bar', 'mozilla-phone'],
+            'email': 'result_email@example.com',
+            'token': 'token'
+        }
+
+        unsubscribe_user_task(result)
+        unsubscribe_mock.assert_called_with(token='token', email='result_email@example.com',
+                                            newsletters=['mozilla-phone'], optout=False)
+
+    @patch('mozillians.users.tasks.basket.unsubscribe')
+    def test_unsubscribe_user_task_success(self, unsubscribe_mock):
+        result = {
+            'status': 'ok',
+            'newsletters': ['foo', 'bar', 'foobar'],
+            'email': 'result_email@example.com',
+            'token': 'token'
+        }
+
+        unsubscribe_user_task(result, newsletters=['foo', 'bar'])
+        unsubscribe_mock.assert_called_with(token='token', email='result_email@example.com',
+                                            newsletters=['foo', 'bar'], optout=False)
+
+    @patch('mozillians.users.tasks.unsubscribe_user_task.retry')
+    @patch('mozillians.users.tasks.basket.unsubscribe')
+    def test_unsubscribe_user_basket_error(self, unsubscribe_mock, retry_mock):
+        result = {
+            'status': 'ok',
+            'newsletters': ['foo', 'bar'],
+            'email': 'result_email@example.com',
+            'token': 'token'
+        }
+
+        exc = BasketException(u'Error error error')
+        unsubscribe_mock.side_effect = [exc, None]
+        retry_mock.side_effect = Retry
+        with self.assertRaises(Retry):
+            unsubscribe_user_task(result, newsletters=['foo', 'bar'])
+        retry_mock.called_with(exc)

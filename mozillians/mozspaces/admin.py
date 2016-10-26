@@ -2,11 +2,11 @@ from django import forms
 from django.contrib import admin
 from django.core.urlresolvers import reverse
 
-import autocomplete_light
-from import_export.admin import ExportMixin
+from dal import autocomplete
 from product_details import product_details
 from sorl.thumbnail.admin import AdminImageMixin
 
+from mozillians.common.mixins import MozilliansAdminExportMixin
 from models import Keyword, MozSpace, Photo
 
 
@@ -34,17 +34,27 @@ class MozSpaceAdminForm(forms.ModelForm):
         model = MozSpace
 
 
-class MozSpaceAdmin(ExportMixin, admin.ModelAdmin):
-    form = MozSpaceAdminForm
+class MozSpaceAutocompleteForm(forms.ModelForm):
+
+    class Meta:
+        model = MozSpace
+        fields = ('__all__')
+        widgets = {
+            'coordinator': autocomplete.ModelSelect2(url='mozspaces:coordinator-autocomplete')
+        }
+
+
+class MozSpaceAdmin(MozilliansAdminExportMixin, admin.ModelAdmin):
     inlines = [PhotoAdmin, KeywordAdmin]
     search_fields = ['name']
     list_display = ['name', 'city', 'country', 'coordinator_link']
-    form = autocomplete_light.modelform_factory(MozSpace)
+    form = MozSpaceAutocompleteForm
 
     def coordinator_link(self, obj):
         url = reverse('admin:auth_user_change', args=[obj.id])
         full_name = obj.coordinator.userprofile.full_name
         return u'<a href="%s">%s</a>' % (url, full_name)
+
     coordinator_link.allow_tags = True
     coordinator_link.short_description = 'coordinator'
 

@@ -1,5 +1,6 @@
 # This is an example settings_local.py file.
 # flake8: noqa
+from . import base
 
 # For absolute urls
 DOMAIN = "127.0.0.1"
@@ -27,6 +28,12 @@ DATABASES = {
     },
 }
 
+# Uncomment in order to use django-debug-toolbar
+# INSTALLED_APPS = base.INSTALLED_APPS + ('debug_toolbar',)
+# MIDDLEWARE_CLASSES = (('debug_toolbar.middleware.DebugToolbarMiddleware',) +
+#                      base.MIDDLEWARE_CLASSES)
+# INTERNAL_IPS = ('127.0.0.1',)
+
 #Serve Profile Photos from django
 UPLOAD_URL = '/media/uploads'
 
@@ -45,7 +52,11 @@ ADMINS = (
 
 MANAGERS = ADMINS
 
-DEBUG = TEMPLATE_DEBUG = True
+DEBUG = True
+from .base import TEMPLATES
+for backend in TEMPLATES:
+    backend['OPTIONS']['debug'] = DEBUG
+
 # ElasticSearch
 ES_DISABLED = False
 ES_URLS = ['es_1:9200']
@@ -60,13 +71,11 @@ JAVA_BIN = '/usr/bin/java'
 
 SESSION_COOKIE_SECURE = False
 
-CACHES = {}
-
 STATSD_CLIENT = 'django_statsd.clients.log'
 
 # Basket
 BASKET_URL = None
-BASKET_NEWSLETTER = 'mozilla-phone'
+BASKET_API_KEY = 'basket_api_key'
 BASKET_MANAGERS = None # or list of email addresses.
 
 GA_ACCOUNT_CODE = None
@@ -77,9 +86,34 @@ SECRET_KEY = 'localdev'
 
 CACHES = {
     'default': {
-        'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
-        'LOCATION': 'unique-snowflake'
+        'BACKEND': 'django.core.cache.backends.memcached.MemcachedCache',
+        'LOCATION': 'memcached_1:11211',
+        'KEY_PREFIX': 'mozillians_local_dev'
     }
 }
 
 BROWSERID_AUDIENCES = None
+CSP_REPORT_ENABLE = False
+CSP_DEFAULT_SRC = base.CSP_DEFAULT_SRC + (
+    'http://*.mapbox.com',
+)
+CSP_FONT_SRC = base.CSP_FONT_SRC + (
+    'http://*.mozilla.net',
+    'http://*.mozilla.org',
+    'http://mozorg.cdn.mozilla.net',
+)
+CSP_IMG_SRC = base.CSP_IMG_SRC + (
+    'http://*.mozilla.net',
+    'http://*.mozilla.org',
+    'http://*.mapbox.com',
+)
+CSP_SCRIPT_SRC = base.CSP_SCRIPT_SRC + (
+    'http://*.mozilla.net',
+    'http://*.mozilla.org',
+    'http://*.mapbox.com',
+)
+CSP_STYLE_SRC = base.CSP_STYLE_SRC + (
+    'http://*.mozilla.net',
+    'http://*.mozilla.org',
+    'http://*.mapbox.com',
+)

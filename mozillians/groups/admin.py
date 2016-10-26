@@ -7,13 +7,14 @@ from django.db.models import Count
 from django.utils.html import escape
 from django.utils.safestring import mark_safe
 
-import autocomplete_light
-from import_export.admin import ExportMixin
+from dal import autocomplete
 from import_export.fields import Field
 from import_export.resources import ModelResource
 
+from mozillians.common.mixins import MozilliansAdminExportMixin
 from mozillians.groups.models import (Group, GroupAlias, GroupMembership,
-                                      Skill, SkillAlias)
+                                      Invite, Skill, SkillAlias)
+from mozillians.phonebook.admin import RedeemedInviteFilter
 
 
 class EmptyGroupFilter(SimpleListFilter):
@@ -96,6 +97,23 @@ class NoURLFilter(SimpleListFilter):
         return queryset
 
 
+class InvalidateGroupFilter(SimpleListFilter):
+    """Admin filter for groups that can expire."""
+    title = 'Group Expiration'
+    parameter_name = 'expires'
+
+    def lookups(self, request, model_admin):
+        return (('0', 'Group does not expire'),
+                ('1', 'Group expires'),)
+
+    def queryset(self, request, queryset):
+        if self.value() is None:
+            return queryset
+        if self.value() == '1':
+            return queryset.filter(invalidation_days__isnull=False)
+        return queryset.filter(invalidation_days__isnull=True)
+
+
 class GroupBaseEditAdminForm(forms.ModelForm):
     merge_with = forms.ModelMultipleChoiceField(
         required=False, queryset=None,
@@ -111,7 +129,7 @@ class GroupBaseEditAdminForm(forms.ModelForm):
         return super(GroupBaseEditAdminForm, self).save(*args, **kwargs)
 
 
-class GroupBaseAdmin(ExportMixin, admin.ModelAdmin):
+class GroupBaseAdmin(MozilliansAdminExportMixin, admin.ModelAdmin):
     """GroupBase Admin."""
     save_on_top = True
     search_fields = ['name', 'aliases__name', 'url', 'aliases__url']
@@ -150,31 +168,45 @@ class GroupAddAdminForm(forms.ModelForm):
 
     class Meta:
         model = Group
+        fields = '__all__'
+        widgets = {
+            'curators': autocomplete.ModelSelect2Multiple(url='users:vouched-autocomplete')
+        }
 
 
 class GroupEditAdminForm(GroupBaseEditAdminForm):
 
     class Meta:
         model = Group
+        fields = '__all__'
+        widgets = {
+            'curators': autocomplete.ModelSelect2Multiple(url='users:vouched-autocomplete'),
+        }
+
+
+class InviteInline(admin.StackedInline):
+    model = Invite
+    extra = 0
 
 
 class GroupAdmin(GroupBaseAdmin):
     """Group Admin."""
-    form = autocomplete_light.modelform_factory(Group, form=GroupEditAdminForm)
-    add_form = autocomplete_light.modelform_factory(Group, form=GroupAddAdminForm)
+    form = GroupEditAdminForm
+    add_form = GroupAddAdminForm
     inlines = [GroupAliasInline]
-    list_display = ['name', 'get_curators', 'functional_area', 'accepting_new_members',
-                    'members_can_leave', 'visible', 'total_member_count', 'full_member_count',
-                    'pending_member_count', 'pending_terms_member_count']
+    list_display = ['name', 'get_curators', 'get_invites', 'functional_area',
+                    'accepting_new_members', 'members_can_leave', 'visible', 'total_member_count',
+                    'full_member_count', 'pending_member_count', 'pending_terms_member_count']
     list_filter = [CuratedGroupFilter, EmptyGroupFilter, FunctionalAreaFilter, VisibleGroupFilter,
-                   NoURLFilter]
+                   NoURLFilter, InvalidateGroupFilter]
     readonly_fields = ['url', 'total_member_count', 'full_member_count', 'pending_member_count',
                        'pending_terms_member_count', 'max_reminder']
+    search_fields = ('curators__user__username',)
 
     fieldsets = (
         ('Group', {
             'fields': ('name', 'url', 'description', 'irc_channel', 'website', 'wiki',
-                       'visible', 'terms', 'invalidation_days')
+                       'visible', 'terms', 'invalidation_days', 'invite_email_text',)
         }),
         ('Functional Area', {
             'fields': ('functional_area', 'curators',)
@@ -183,12 +215,12 @@ class GroupAdmin(GroupBaseAdmin):
             'fields': (('accepting_new_members', 'new_member_criteria',),
                        'members_can_leave',
                        ('total_member_count', 'full_member_count', 'pending_member_count',
-                        'pending_terms_member_count'), )
+                        'pending_terms_member_count',),)
         }),
         ('Debug info', {
             'fields': ('max_reminder',),
             'classes': ('collapse',)
-        })
+        }),
     )
 
     def get_form(self, request, obj=None, **kwargs):
@@ -219,6 +251,14 @@ class GroupAdmin(GroupBaseAdmin):
         return mark_safe(', '.join(profile_urls))
     get_curators.short_description = 'Curators'
 
+    def get_invites(self, obj):
+        url = u"<a href='{0}'>{1}</a>"
+        profile_urls = [url.format(reverse('admin:users_userprofile_change', args=[profile.id]),
+                                   escape(profile.full_name))
+                        for profile in obj.invites.all()]
+        return mark_safe(', '.join(profile_urls))
+    get_invites.short_description = 'Invites'
+
 
 class GroupMembershipResource(ModelResource):
     """django-import-export Groupmembership Resource."""
@@ -229,18 +269,18 @@ class GroupMembershipResource(ModelResource):
         model = GroupMembership
 
 
-class GroupMembershipAdminForm(forms.ModelForm):
+class BaseGroupMembershipAutocompleteForm(forms.ModelForm):
 
     class Meta:
         model = GroupMembership
+        fields = '__all__'
         widgets = {
-            # Use autocomplete_light to allow any user profile.
-            'userprofile': autocomplete_light.ChoiceWidget('UserProfiles'),
-            'group': autocomplete_light.ChoiceWidget('Groups'),
+            'userprofile': autocomplete.ModelSelect2(url='users:vouched-autocomplete'),
+            'group': autocomplete.ModelSelect2(url='groups:group-autocomplete')
         }
 
 
-class GroupMembershipAdmin(ExportMixin, admin.ModelAdmin):
+class GroupMembershipAdmin(MozilliansAdminExportMixin, admin.ModelAdmin):
     resource_class = GroupMembershipResource
     list_display = ['group', 'userprofile']
     search_fields = [
@@ -251,7 +291,7 @@ class GroupMembershipAdmin(ExportMixin, admin.ModelAdmin):
         'userprofile__geo_country__name', 'userprofile__user__username',
         'userprofile__user__email'
     ]
-    form = GroupMembershipAdminForm
+    form = BaseGroupMembershipAutocompleteForm
 
 
 class SkillAliasInline(admin.StackedInline):
@@ -262,12 +302,14 @@ class SkillAddAdminForm(forms.ModelForm):
 
     class Meta:
         model = Skill
+        fields = '__all__'
 
 
 class SkillEditAdminForm(GroupBaseEditAdminForm):
 
     class Meta:
         model = Skill
+        fields = '__all__'
 
 
 class SkillAdmin(GroupBaseAdmin):
@@ -275,6 +317,28 @@ class SkillAdmin(GroupBaseAdmin):
     add_form = SkillAddAdminForm
     inlines = [SkillAliasInline]
 
+
+class InviteAutocompleteForm(forms.ModelForm):
+
+    class Meta:
+        model = Invite
+        fields = ('__all__')
+        widgets = {
+            'inviter': autocomplete.ModelSelect2(url='users:vouched-autocomplete'),
+            'redeemer': autocomplete.ModelSelect2(url='users:vouched-autocomplete'),
+            'group': autocomplete.ModelSelect2(url='groups:group-autocomplete')
+        }
+
+
+class InviteAdmin(MozilliansAdminExportMixin, admin.ModelAdmin):
+    search_fields = ['inviter', 'redeemer', 'group']
+    list_display = ['inviter', 'redeemer', 'group']
+    readonly_fields = ['created', 'updated']
+    list_filter = [RedeemedInviteFilter]
+    form = InviteAutocompleteForm
+
+
 admin.site.register(Group, GroupAdmin)
 admin.site.register(GroupMembership, GroupMembershipAdmin)
 admin.site.register(Skill, SkillAdmin)
+admin.site.register(Invite, InviteAdmin)

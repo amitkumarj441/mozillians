@@ -7,11 +7,14 @@ from django.conf import settings
 from django.contrib.auth.models import User
 from django.core.files.uploadedfile import UploadedFile
 from django.forms.models import BaseInlineFormSet, inlineformset_factory
+from django.forms.widgets import RadioSelect
+from django.utils.translation import ugettext as _, ugettext_lazy as _lazy
 
 import django_filters
 import happyforms
+from dal import autocomplete, fields as dal_fields
+from nocaptcha_recaptcha.fields import NoReCaptchaField
 from PIL import Image
-from tower import ugettext as _, ugettext_lazy as _lazy
 
 from mozillians.api.models import APIv2App
 from mozillians.groups.models import Skill
@@ -19,7 +22,7 @@ from mozillians.phonebook.models import Invite
 from mozillians.phonebook.validators import validate_username
 from mozillians.phonebook.widgets import MonthYearWidget
 from mozillians.users import get_languages_for_locale
-from mozillians.users.models import ExternalAccount, Language, UserProfile
+from mozillians.users.models import AbuseReport, ExternalAccount, Language, UserProfile
 
 
 REGEX_NUMERIC = re.compile('\d+', re.IGNORECASE)
@@ -75,7 +78,7 @@ class EmailPrivacyForm(happyforms.ModelForm):
 
 
 class SearchForm(happyforms.Form):
-    q = forms.CharField(required=False)
+    q = forms.CharField(required=False, max_length=140)
     limit = forms.IntegerField(
         widget=forms.HiddenInput, required=False, min_value=1,
         max_value=settings.ITEMS_PER_PAGE)
@@ -163,8 +166,8 @@ class BasicInformationForm(happyforms.ModelForm):
 
     class Meta:
         model = UserProfile
-        fields = ('photo', 'privacy_photo', 'full_name',
-                  'privacy_full_name', 'bio', 'privacy_bio',)
+        fields = ('photo', 'privacy_photo', 'full_name', 'privacy_full_name',
+                  'full_name_local', 'privacy_full_name_local', 'bio', 'privacy_bio',)
         widgets = {'bio': forms.Textarea()}
 
     def clean_photo(self):
@@ -189,32 +192,70 @@ class BasicInformationForm(happyforms.ModelForm):
         return photo
 
 
+class SkillCreateField(dal_fields.CreateModelFieldMixin, forms.ModelMultipleChoiceField):
+
+    def create_value(self, value):
+        """This is used to create a new Skill,
+        if it doesn't already exist in the database.
+        """
+        skill, _created = Skill.objects.get_or_create(name=value)
+        return skill.id
+
+    def clean(self, value):
+        """Custom clean method.
+
+        Allow only certain characters when creating a new instance.
+        """
+        new_value = ''
+        # value is a list of strings (IDs of saved objects or string values)
+        # eg ['1', '9', 'foo']
+        for item in value:
+
+            try:
+                # Try to validate the list. If the given list has not only
+                # PK values, Django's _check_values in ModelMultipleChoiceField
+                # will raise a ValidationError
+                return super(SkillCreateField, self).clean(value)
+            except forms.ValidationError as e:
+                # catch the non-numberic value (eg 'foo')
+                new_value = e.params.get('pk', None)
+
+            if new_value:
+                # Feed the value to the regex. If we have a match then create
+                # a new Skill in the db and add the corresponding PK to the list of
+                # IDS. Else we have an invalid input, remove it and raise a ValidationError
+                if re.match(r'^[a-zA-Z0-9 +.:,-]*$', new_value):
+                    new_db_item = self.create_value(new_value)
+                    value[value.index(new_value)] = new_db_item
+                else:
+                    value.pop(value.index(new_value))
+                    msg = _(u'Skills can only contain latin characters and +.:-.')
+                    self.error_messages['invalid_choice'] = msg
+                    raise forms.ValidationError(self.error_messages['invalid_choice'],
+                                                code='invalid_choice')
+
+        return super(SkillCreateField, self).clean(value)
+
+
 class SkillsForm(happyforms.ModelForm):
-    skills = forms.CharField(
-        label='',
-        help_text=_lazy(u'Start typing to add a skill (example: Python, '
-                        u'javascript, Graphic Design, User Research)'),
-        required=False)
+    skills = SkillCreateField(
+        required=False,
+        queryset=Skill.objects.all(),
+        widget=autocomplete.ModelSelect2Multiple(url='groups:skills-autocomplete'))
 
-    class Meta:
-        model = UserProfile
-        fields = ('privacy_skills',)
-
-    def clean_skills(self):
-        if not re.match(r'^[a-zA-Z0-9 +.:,-]*$', self.cleaned_data['skills']):
-            # Commas cannot be included in skill names because we use them to
-            # separate names in a list
-            raise forms.ValidationError(_(u'Skills can only contain latin characters '
-                                          u'and +.:-.'))
-        skills = self.cleaned_data['skills']
-        return filter(lambda x: x,
-                      map(lambda x: x.strip() or False,
-                          skills.lower().split(',')))
+    def __init__(self, *args, **kwargs):
+        super(SkillsForm, self).__init__(*args, **kwargs)
+        self.fields['skills'].help_text = (u'Start typing to add a skill (example: Python, '
+                                           u'javascript, Graphic Design, User Research)')
 
     def save(self, *args, **kwargs):
         """Save the data to profile."""
         self.instance.set_membership(Skill, self.cleaned_data['skills'])
         super(SkillsForm, self).save(*args, **kwargs)
+
+    class Meta:
+        model = UserProfile
+        fields = ('privacy_skills', 'skills',)
 
 
 class LanguagesPrivacyForm(happyforms.ModelForm):
@@ -324,7 +365,7 @@ class BaseLanguageFormSet(BaseInlineFormSet):
 
 LanguagesFormset = inlineformset_factory(UserProfile, Language,
                                          formset=BaseLanguageFormSet,
-                                         extra=1)
+                                         extra=1, fields='__all__')
 
 
 class EmailForm(happyforms.Form):
@@ -344,6 +385,7 @@ class RegisterForm(BasicInformationForm, LocationForm):
     optin = forms.BooleanField(
         widget=forms.CheckboxInput(attrs={'class': 'checkbox'}),
         required=True)
+    captcha = NoReCaptchaField()
 
     class Meta:
         model = UserProfile
@@ -387,3 +429,16 @@ class APIKeyRequestForm(happyforms.ModelForm):
     class Meta:
         model = APIv2App
         fields = ('name', 'description', 'url',)
+
+
+class AbuseReportForm(happyforms.ModelForm):
+
+    class Meta:
+        model = AbuseReport
+        fields = ('type',)
+        widgets = {
+            'type': RadioSelect
+        }
+        labels = {
+            'type': _(u'What would you like to report?')
+        }

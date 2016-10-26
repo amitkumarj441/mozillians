@@ -3,10 +3,10 @@ from django.test import Client
 
 from nose.tools import eq_, ok_
 
-from mozillians.common.helpers import urlparams
+from mozillians.common.templatetags.helpers import urlparams
 from mozillians.common.tests import TestCase, requires_login, requires_vouch
-from mozillians.groups.models import GroupMembership
-from mozillians.groups.tests import GroupFactory, GroupAliasFactory, SkillFactory
+from mozillians.groups.models import GroupMembership, Invite
+from mozillians.groups.tests import GroupFactory, GroupAliasFactory, InviteFactory, SkillFactory
 from mozillians.users.tests import UserFactory
 
 
@@ -76,7 +76,7 @@ class ShowTests(TestCase):
             response = client.get(url, follow=True)
 
         eq_(response.status_code, 200)
-        self.assertTemplateUsed(response, 'groups/terms.html')
+        self.assertJinja2TemplateUsed(response, 'groups/terms.html')
 
     def test_show_review_terms_accepted(self):
         group = GroupFactory.create(terms='Example terms')
@@ -89,7 +89,7 @@ class ShowTests(TestCase):
             response = client.get(url, follow=True)
 
         eq_(response.status_code, 200)
-        self.assertTemplateUsed(response, 'groups/group.html')
+        self.assertJinja2TemplateUsed(response, 'groups/group.html')
 
     def test_show_group_members_sorted(self):
         """
@@ -367,7 +367,7 @@ class ShowTests(TestCase):
                       kwargs=dict(url=self.group.url, user_pk=self.user_2.userprofile.pk))
         with self.login(self.user_1) as client:
             response = client.get(url, data={'next_url': next_url}, follow=True)
-        self.assertTemplateUsed(response, 'groups/confirm_remove_member.html')
+        self.assertJinja2TemplateUsed(response, 'groups/confirm_remove_member.html')
         # make sure context variable next_url was populated properly
         eq_(response.context['next_url'], next_url)
         # Still a member
@@ -379,9 +379,12 @@ class ShowTests(TestCase):
         self.group.curators.add(self.user_1.userprofile)
         self.group.accepting_new_members = 'by_request'
         self.group.save()
+        invite = InviteFactory(group=self.group, redeemer=self.user_2.userprofile,
+                               inviter=self.user_1.userprofile)
 
         group_url = reverse('groups:show_group', prefix='/en-US/', args=[self.group.url])
         next_url = "%s?filtr=members" % group_url
+        eq_(self.group.invites.all().count(), 1)
 
         # We must request the full path, with language, or the
         # LanguageMiddleware will convert the request to GET.
@@ -395,6 +398,7 @@ class ShowTests(TestCase):
         eq_(membership_filter_form.cleaned_data['filtr'], 'members')
         # Not a member anymore
         ok_(not self.group.has_member(self.user_2.userprofile))
+        ok_(not Invite.objects.filter(pk=invite.pk).exists())
 
     def test_confirm_user(self):
         """POST to confirm user view changes member from pending to member"""
@@ -522,7 +526,7 @@ class TermsTests(TestCase):
             response = client.get(url, follow=True)
 
         eq_(response.status_code, 200)
-        self.assertTemplateUsed(response, 'groups/terms.html')
+        self.assertJinja2TemplateUsed(response, 'groups/terms.html')
 
     def test_accept_review_terms(self):
         group = GroupFactory.create(terms='Example terms')
@@ -541,7 +545,7 @@ class TermsTests(TestCase):
             response = client.post(url, data=data, follow=True)
 
         eq_(response.status_code, 200)
-        self.assertTemplateUsed(response, 'groups/group.html')
+        self.assertJinja2TemplateUsed(response, 'groups/group.html')
 
         membership = GroupMembership.objects.get(group=group, userprofile=user.userprofile)
         eq_(membership.status, GroupMembership.MEMBER)
@@ -563,7 +567,7 @@ class TermsTests(TestCase):
             response = client.post(url, data=data, follow=True)
 
         eq_(response.status_code, 200)
-        self.assertTemplateUsed(response, 'groups/group.html')
+        self.assertJinja2TemplateUsed(response, 'groups/group.html')
 
         membership = GroupMembership.objects.filter(group=group, userprofile=user.userprofile)
         ok_(not membership.exists())

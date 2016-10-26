@@ -1,3 +1,4 @@
+import os
 from django.core.urlresolvers import reverse
 
 from mock import patch
@@ -16,6 +17,9 @@ from mozillians.users.tests import UserFactory
 
 class ProfileEditTests(TestCase):
 
+    def setUp(self):
+        os.environ['NORECAPTCHA_TESTING'] = 'True'
+
     def test_profile_edit_vouched_links_to_groups_page(self):
         """A vouched user editing their profile is shown a link to the groups page.
         """
@@ -25,7 +29,7 @@ class ProfileEditTests(TestCase):
             response = client.get(url, follow=True)
         eq_(response.status_code, 200)
         groups_url = reverse('groups:index_groups', prefix='/en-US/')
-        ok_(groups_url in response.content)
+        ok_(groups_url in unicode(response.content, 'utf-8'))
 
     def test_profile_edit_unvouched_doesnt_link_to_groups_page(self):
         """An unvouched user editing their profile is not shown a link to the groups page.
@@ -36,7 +40,7 @@ class ProfileEditTests(TestCase):
             response = client.get(url, follow=True)
         eq_(response.status_code, 200)
         groups_url = reverse('groups:index_groups', prefix='/en-US/')
-        ok_(groups_url not in response.content)
+        ok_(groups_url not in unicode(response.content, 'utf-8'))
 
     def test_section_does_not_exist(self):
         """When not section exists in request.POST, 404 is raised."""
@@ -152,6 +156,8 @@ class ProfileEditTests(TestCase):
     @patch('mozillians.phonebook.views.messages.info')
     def test_succesful_registration(self, info_mock):
         user = UserFactory.create(first_name='', last_name='')
+        ok_(not UserProfile.objects.filter(full_name='foo bar').exists())
+
         url = reverse('phonebook:profile_edit', prefix='/en-US/')
         data = {
             'full_name': 'foo bar',
@@ -160,7 +166,8 @@ class ProfileEditTests(TestCase):
             'lat': 40.005814,
             'lng': -3.42071,
             'optin': True,
-            'registration_section': ''
+            'registration_section': '',
+            'g-recaptcha-response': 'PASSED'
         }
         data.update(_get_privacy_fields(MOZILLIANS))
         with self.login(user) as client:
@@ -168,6 +175,10 @@ class ProfileEditTests(TestCase):
 
         eq_(response.status_code, 200)
         ok_(info_mock.called)
+        ok_(UserProfile.objects.get(full_name='foo bar'))
+
+        def tearDown(self):
+            del os.environ['NORECAPTCHA_TESTING']
 
 
 class LocationEditTests(TestCase):

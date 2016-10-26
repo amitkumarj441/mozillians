@@ -2,31 +2,35 @@ import json
 
 from collections import defaultdict
 
+from django.http import JsonResponse
 from django.conf import settings
 from django.contrib import messages
 from django.core.paginator import EmptyPage, Paginator, PageNotAnInteger
 from django.db.models import Q
-from django.http import HttpResponse, HttpResponseBadRequest, Http404
+from django.http import HttpResponse, HttpResponseBadRequest, HttpResponseRedirect, Http404
 from django.shortcuts import get_object_or_404, redirect, render
 from django.views.decorators.cache import cache_control, never_cache
 from django.views.decorators.http import require_POST
+from django.utils.translation import ugettext as _
 
-from mozillians.users.models import UserProfile
-from tower import ugettext as _
+from dal import autocomplete
 
 from mozillians.common.decorators import allow_unvouched
-from mozillians.common.helpers import get_object_or_none
+from mozillians.common.templatetags.helpers import get_object_or_none, urlparams
 from mozillians.common.urlresolvers import reverse
-from mozillians.groups.forms import (GroupForm, TermsReviewForm,
-                                     MembershipFilterForm, SortForm,
-                                     SuperuserGroupForm)
-from mozillians.groups.models import Group, Skill, GroupMembership
+from mozillians.groups import forms
+from mozillians.groups.models import Group, GroupMembership, Invite, Skill
+from mozillians.groups.tasks import (notify_curators_invitation_accepted,
+                                     notify_curators_invitation_rejected,
+                                     notify_redeemer_invitation,
+                                     notify_redeemer_invitation_invalid)
+from mozillians.users.models import UserProfile
 
 
-def _list_groups(request, template, query):
+def _list_groups(request, template, query, context={}):
     """Lists groups from given query."""
 
-    sort_form = SortForm(request.GET)
+    sort_form = forms.SortForm(request.GET)
     show_pagination = False
 
     if sort_form.is_valid():
@@ -47,7 +51,14 @@ def _list_groups(request, template, query):
     if paginator.count > settings.ITEMS_PER_PAGE:
         show_pagination = True
 
-    data = dict(groups=groups, page=page, sort_form=sort_form, show_pagination=show_pagination)
+    data = {
+        'groups': groups,
+        'page': page,
+        'sort_form': sort_form,
+        'show_pagination': show_pagination
+    }
+
+    data.update(context)
     return render(request, template, data)
 
 
@@ -57,9 +68,20 @@ def index_groups(request):
     Doesn't list functional areas, invisible groups, and groups with
     no vouched members
     """
+
+    group_form = forms.GroupCreateForm(request.POST or None)
+    if group_form.is_valid():
+        group = group_form.save()
+        group.curators.add(request.user.userprofile)
+        group.add_member(request.user.userprofile, GroupMembership.MEMBER)
+        return redirect(reverse('groups:group_edit', args=[group.url]))
+
     query = Group.get_non_functional_areas()
     template = 'groups/index_groups.html'
-    return _list_groups(request, template, query)
+    context = {
+        'group_form': group_form
+    }
+    return _list_groups(request, template, query, context)
 
 
 def index_skills(request):
@@ -104,7 +126,7 @@ def show(request, url, alias_model, template):
     is_manager = request.user.userprofile.is_manager
     is_pending = False
     show_delete_group_button = False
-    membership_filter_form = MembershipFilterForm(request.GET)
+    membership_filter_form = forms.MembershipFilterForm(request.GET)
 
     group = group_alias.alias
     profile = request.user.userprofile
@@ -127,7 +149,7 @@ def show(request, url, alias_model, template):
 
         # initialize the form only when the group is moderated and user is curator of the group
         if is_curator and group.accepting_new_members == 'by_request':
-            membership_filter_form = MembershipFilterForm(request.GET)
+            membership_filter_form = forms.MembershipFilterForm(request.GET)
         else:
             membership_filter_form = None
 
@@ -150,6 +172,8 @@ def show(request, url, alias_model, template):
             memberships = group.groupmembership_set.filter(
                 Q(status=GroupMembership.MEMBER) | Q(userprofile=profile))
 
+        invitation = get_object_or_none(Invite, redeemer=profile, group=group, accepted=False)
+        data.update(invitation=invitation)
         # Order by UserProfile.Meta.ordering
         memberships = memberships.order_by('userprofile')
 
@@ -293,7 +317,7 @@ def review_terms(request, url):
                                    userprofile=request.user.userprofile,
                                    status=GroupMembership.PENDING_TERMS)
 
-    membership_form = TermsReviewForm(request.POST or None)
+    membership_form = forms.TermsReviewForm(request.POST or None)
     if membership_form.is_valid():
         if membership_form.cleaned_data['terms_accepted'] == 'True':
             group.add_member(request.user.userprofile, GroupMembership.MEMBER)
@@ -376,42 +400,178 @@ def group_delete(request, url):
 
 
 @never_cache
-def group_add_edit(request, url=None):
-    """
-    Add or edit a group.  (If a url is passed in, we're editing.)
-    """
+def group_edit(request, url=None):
+    """Add or edit a group. (if there is a url we are editing)"""
 
     profile = request.user.userprofile
     is_manager = request.user.userprofile.is_manager
+    invites = None
+    forms_valid = True
+    group_forms = {}
+    form_key = None
+    show_delete_group_button = False
 
-    if url:
-        # Get the group to edit
-        group = get_object_or_404(Group, url=url)
-        # Only a group curator or an admin is allowed to edit a group
-        is_curator = profile in group.curators.all()
-        if not (is_curator or is_manager):
-            messages.error(request, _('You must be a curator or an admin to edit a group'))
-            return redirect(reverse('groups:show_group', args=[group.url]))
-    else:
-        group = Group()
+    if not url:
+        return redirect(reverse('groups:index_groups'))
 
-    form_class = SuperuserGroupForm if is_manager else GroupForm
-
-    curators_ids = [profile.id]
-    if url:
-        curators_ids = group.curators.all().values_list('id', flat=True)
-
-    form = form_class(request.POST or None, instance=group,
-                      initial={'curators': curators_ids})
-
-    if form.is_valid():
-        group = form.save()
-
+    # Get the group to edit
+    group = get_object_or_404(Group, url=url)
+    # Only a group curator or an admin is allowed to edit a group
+    is_curator = profile in group.curators.all()
+    is_manager = request.user.userprofile.is_manager
+    if not (is_curator or is_manager):
+        messages.error(request, _('You must be a curator or an admin to edit a group'))
         return redirect(reverse('groups:show_group', args=[group.url]))
 
+    invites = group.invites.filter(groups_invited__accepted=False)
+    show_delete_group_button = is_curator and group.members.all().count() == 1
+
+    # Prepare the forms for rendering
+    group_forms['basic_form'] = forms.GroupBasicForm
+    group_forms['curator_form'] = forms.GroupCuratorsForm
+    group_forms['terms_expiration_form'] = forms.GroupTermsExpirationForm
+    group_forms['invite_form'] = forms.GroupInviteForm
+    group_forms['admin_form'] = forms.GroupAdminForm
+    group_forms['criteria_form'] = forms.GroupCriteriaForm
+    group_forms['email_form'] = forms.GroupCustomEmailForm
+
+    def _init_group_forms(request, group_forms):
+        form_args = {
+            'data': None,
+            'instance': group,
+            'request': request
+        }
+        key = None
+
+        if request.POST:
+            form_args['data'] = request.POST
+            key, form = next(((k, v(**form_args)) for k, v in group_forms.items()
+                              if k in request.POST), (None, None))
+            if key and form:
+                group_forms[key] = form
+
+        # Initialize the rest of the forms with non-POST data
+        form_args['data'] = None
+        for k in group_forms.keys():
+            if k != key:
+                group_forms[k] = group_forms[k](**form_args)
+        return key
+
+    form_key = _init_group_forms(request, group_forms)
+
+    form = group_forms[form_key] if form_key else None
+    if form and form.is_bound and form.is_valid():
+        form.save()
+        next_section = request.GET.get('next')
+        next_url = urlparams(reverse('groups:group_edit', args=[group.url]), next_section)
+        return HttpResponseRedirect(next_url)
+    elif request.POST:
+        forms_valid = False
+
     context = {
-        'form': form,
-        'creating': url is None,
-        'group': group if url else None
+        'group': group if url else None,
+        'invites': invites if group else None,
+        'forms_valid': forms_valid,
+        'user_is_curator': is_curator,
+        'user_is_manager': is_manager,
+        'show_delete_group_button': show_delete_group_button
     }
-    return render(request, 'groups/add_edit.html', context)
+    context.update(group_forms)
+    return render(request, 'groups/edit_group.html', context)
+
+
+class SkillsAutocomplete(autocomplete.Select2QuerySetView):
+
+    def __init__(self, *args, **kwargs):
+        super(SkillsAutocomplete, self).__init__(*args, **kwargs)
+        self.cached_skills = list(Skill.objects.all().values_list('name', flat=True))
+
+    def get_queryset(self):
+
+        qs = Skill.objects.all()
+        if self.q:
+            qs = qs.filter(name__istartswith=self.q)
+        return qs
+
+    def render_to_response(self, context):
+        """Override base render_to_response.
+
+        Return a JSON response in Select2 format."""
+        create_option = []
+
+        q = self.request.GET.get('q', None)
+
+        if (self.request.GET.get('create', None) == 'true' and q and
+                q.lower() not in self.cached_skills):
+            create_option = [{
+                'id': q,
+                'text': 'Create "%s"' % q
+            }]
+
+        data = {
+            'results': self.get_results(context) + create_option,
+            'more': self.has_more(context)
+        }
+
+        return JsonResponse(data)
+
+
+# Invite views
+def delete_invite(request, invite_pk):
+    """Delete an invite to join a group."""
+
+    invite = get_object_or_404(Invite, pk=invite_pk)
+    group = invite.group
+
+    if (group.curators.filter(id=request.user.userprofile.id).exists() or
+            request.user.userprofile.is_manager):
+        redeemer = invite.redeemer
+        invite.delete()
+        notify_redeemer_invitation_invalid.delay(redeemer.pk, group.pk)
+        msg = _(u'The invitation to {0} has been successfully revoked.').format(redeemer)
+        messages.success(request, msg)
+        next_section = request.GET.get('next')
+        next_url = urlparams(reverse('groups:group_edit', args=[group.url]), next_section)
+        return HttpResponseRedirect(next_url)
+    raise Http404()
+
+
+@never_cache
+def accept_reject_invitation(request, invite_pk, action):
+    """Accept or reject group invitation."""
+
+    redeemer = request.user.userprofile
+    invite = get_object_or_404(Invite, pk=invite_pk, redeemer=redeemer)
+    if action == 'accept':
+        if invite.group.terms:
+            invite.group.add_member(redeemer, GroupMembership.PENDING_TERMS)
+        else:
+            invite.group.add_member(redeemer, GroupMembership.MEMBER)
+        invite.accepted = True
+        invite.save()
+        notify_curators_invitation_accepted.delay(invite.pk)
+    else:
+        notify_curators_invitation_rejected.delay(redeemer.pk, invite.inviter.pk, invite.group.pk)
+        invite.delete()
+
+    return redirect(reverse('groups:show_group', args=[invite.group.url]))
+
+
+@never_cache
+def send_invitation_email(request, invite_pk):
+    """Send group invitation email."""
+
+    invite = get_object_or_404(Invite, pk=invite_pk)
+    is_curator = invite.group.curators.filter(pk=request.user.userprofile.pk).exists()
+    is_manager = request.user.userprofile.is_manager
+
+    if not (is_curator or is_manager):
+        raise Http404
+
+    notify_redeemer_invitation.delay(invite.pk, invite.group.invite_email_text)
+    msg = _(u'Invitation to {0} has been sent successfully.'.format(invite.redeemer))
+    messages.success(request, msg)
+    next_section = request.GET.get('next')
+    next_url = urlparams(reverse('groups:group_edit', args=[invite.group.url]), next_section)
+
+    return HttpResponseRedirect(next_url)

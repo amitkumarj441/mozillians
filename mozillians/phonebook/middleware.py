@@ -5,9 +5,9 @@ from django.contrib import messages
 from django.contrib.auth.models import User
 from django.core.urlresolvers import is_valid_path, reverse
 from django.http import HttpResponseRedirect
-from tower import ugettext as _
+from django.utils.translation import ugettext as _
 
-from mozillians.common.helpers import redirect
+from mozillians.common.templatetags.helpers import redirect
 from mozillians.common.middleware import safe_query_string
 
 
@@ -18,7 +18,7 @@ class RegisterMiddleware():
             r'^/[\w-]+{0}'.format(reverse('phonebook:logout')),
             r'^/[\w-]+{0}'.format(reverse('phonebook:login')),
             r'^/[\w-]+{0}'.format(reverse('phonebook:profile_edit')),
-            r'^/[\w-]+{0}'.format(reverse('groups:search_skills')),
+            r'^/[\w-]+{0}'.format(reverse('groups:skills-autocomplete')),
             r'^/browserid/',
         ]
 

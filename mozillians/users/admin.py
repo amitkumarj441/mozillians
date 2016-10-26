@@ -13,20 +13,23 @@ from django.db.models import Count, Q
 from django.forms import ValidationError
 from django.http import HttpResponseRedirect
 
-import autocomplete_light
+from dal import autocomplete
 from celery.task.sets import TaskSet
 from functools import update_wrapper
-from import_export.admin import ExportMixin
 from import_export.fields import Field
 from import_export.resources import ModelResource
 from sorl.thumbnail.admin import AdminImageMixin
 
-import mozillians.users.tasks
-from mozillians.common.helpers import get_datetime
+from mozillians.common.mixins import MozilliansAdminExportMixin
+from mozillians.common.templatetags.helpers import get_datetime
+from mozillians.groups.admin import BaseGroupMembershipAutocompleteForm
 from mozillians.groups.models import GroupMembership, Skill
+from mozillians.users.models import get_languages_for_locale
 from mozillians.users.cron import index_all_profiles
-from mozillians.users.models import (PUBLIC, Language, ExternalAccount, Vouch,
-                                     UserProfile, UsernameBlacklist)
+from mozillians.users.models import (AbuseReport, ExternalAccount, Language, PUBLIC,
+                                     UserProfile, UsernameBlacklist, Vouch)
+from mozillians.users.tasks import (check_celery, subscribe_user_to_basket,
+                                    unsubscribe_from_basket_task)
 
 
 admin.site.unregister(Group)
@@ -38,32 +41,35 @@ for field in UserProfile.privacy_fields():
     Q_PUBLIC_PROFILES |= Q(**{key: PUBLIC})
 
 
-def subscribe_to_basket_action():
+def subscribe_to_basket_action(newsletter):
     """Subscribe to Basket action."""
 
     def subscribe_to_basket(modeladmin, request, queryset):
         """Subscribe to Basket or update details of already subscribed."""
-        ts = [(mozillians.users.tasks.update_basket_task
-               .subtask(args=[userprofile.id]))
+        ts = [(subscribe_user_to_basket.subtask(args=[userprofile.id, [newsletter]]))
               for userprofile in queryset]
         TaskSet(ts).apply_async()
         messages.success(request, 'Basket update started.')
-    subscribe_to_basket.short_description = 'Subscribe to or Update Basket'
+
+    subscribe_to_basket.short_description = 'Subscribe to or Update {0}'.format(newsletter)
+    subscribe_to_basket.__name__ = 'subscribe_to_basket_{0}'.format(newsletter.replace('-', '_'))
     return subscribe_to_basket
 
 
-def unsubscribe_from_basket_action():
+def unsubscribe_from_basket_action(newsletter):
     """Unsubscribe from Basket action."""
 
     def unsubscribe_from_basket(modeladmin, request, queryset):
         """Unsubscribe from Basket."""
-        ts = [(mozillians.users.tasks.unsubscribe_from_basket_task
-               .subtask(args=[userprofile.user.email, userprofile.basket_token]))
+        ts = [(unsubscribe_from_basket_task.subtask(args=[userprofile.user.email,
+                                                          [newsletter]]))
               for userprofile in queryset]
         TaskSet(ts).apply_async()
         messages.success(request, 'Basket update started.')
-    unsubscribe_from_basket.short_description = 'Unsubscribe from Basket'
 
+    unsubscribe_from_basket.short_description = 'Unsubscribe from {0}'.format(newsletter)
+    func_name = 'unsubscribe_from_basket_{0}'.format(newsletter.replace('-', '_'))
+    unsubscribe_from_basket.__name__ = func_name
     return unsubscribe_from_basket
 
 
@@ -140,9 +146,9 @@ class DateJoinedFilter(SimpleListFilter):
     parameter_name = 'date_joined'
 
     def lookups(self, request, model_admin):
-
-        return map(lambda x: (str(x.year), x.year),
-                   User.objects.datetimes('date_joined', 'year'))
+        join_dates = User.objects.values_list('date_joined', flat=True)
+        join_years = [x.year for x in join_dates]
+        return [(str(x), x) for x in set(join_years)]
 
     def queryset(self, request, queryset):
         if self.value() is None:
@@ -227,7 +233,46 @@ class LegacyVouchFilter(SimpleListFilter):
         return queryset
 
 
-class UsernameBlacklistAdmin(ExportMixin, admin.ModelAdmin):
+class NDAMemberFilter(SimpleListFilter):
+    """Admin filter for profiles member of the NDA group"""
+    title = "NDA member"
+    parameter_name = 'nda_member'
+
+    def lookups(self, request, model_admin):
+        return (('False', 'No'),
+                ('True', 'Yes'))
+
+    def queryset(self, request, queryset):
+        from mozillians.groups.models import Group, GroupMembership
+        group = Group.objects.get(name=settings.NDA_GROUP)
+        memberships = GroupMembership.objects.filter(group=group, status=GroupMembership.MEMBER)
+        profile_ids = memberships.values_list('userprofile__id', flat=True)
+
+        if self.value() == 'False':
+            return queryset.exclude(id__in=profile_ids)
+        elif self.value() == 'True':
+            return queryset.filter(id__in=profile_ids)
+        return queryset
+
+
+class BasketTokenFilter(SimpleListFilter):
+    """Admin filter for profiles with associated basket token"""
+    title = 'has basket token'
+    parameter_name = 'basket_token'
+
+    def lookups(self, request, model_admin):
+        return (('yes', 'Yes'),
+                ('no', 'No'))
+
+    def queryset(self, request, queryset):
+        if self.value() == 'yes':
+            return queryset.exclude(basket_token='')
+        elif self.value() == 'no':
+            return queryset.filter(basket_token='')
+        return queryset
+
+
+class UsernameBlacklistAdmin(MozilliansAdminExportMixin, admin.ModelAdmin):
     """UsernameBlacklist Admin."""
     save_on_top = True
     search_fields = ['value']
@@ -238,11 +283,49 @@ class UsernameBlacklistAdmin(ExportMixin, admin.ModelAdmin):
 admin.site.register(UsernameBlacklist, UsernameBlacklistAdmin)
 
 
-class LanguageAdmin(ExportMixin, admin.ModelAdmin):
-    search_fields = ['userprofile__full_name', 'userprofile__user__email', 'code']
-    list_display = ['code', 'userprofile']
-    list_filter = ['code']
+class MissingLanguagesFilter(SimpleListFilter):
+    title = 'Missing language'
+    parameter_name = 'missing_language'
 
+    def lookups(self, request, model_admin):
+        return (('False', 'No'),
+                ('True', 'Yes'))
+
+    def queryset(self, request, queryset):
+        current_language_codes = set(Language.objects.values_list('code', flat=True))
+        babel_language_codes = set([code for code, lang in get_languages_for_locale('en')])
+
+        if self.value() == 'True':
+            missing_language_codes = current_language_codes.difference(babel_language_codes)
+            return queryset.filter(code__in=list(missing_language_codes))
+
+        if self.value() == 'False':
+            return queryset.filter(code__in=list(babel_language_codes))
+
+        return queryset
+
+
+class LanguageResource(ModelResource):
+    """django-import-export Language resource."""
+    email = Field(attribute='userprofile__user__email')
+
+    class Meta:
+        model = Language
+
+
+class LanguageAdmin(MozilliansAdminExportMixin, admin.ModelAdmin):
+    resource_class = LanguageResource
+    search_fields = ['userprofile__full_name', 'userprofile__user__email', 'code']
+    list_display = ['get_code', 'get_language_name', 'userprofile']
+    list_filter = ['code', MissingLanguagesFilter]
+
+    def get_code(self, obj):
+        return obj.code
+    get_code.short_description = 'Code'
+
+    def get_language_name(self, obj):
+        return obj.get_code_display()
+    get_language_name.short_description = 'Name'
 
 admin.site.register(Language, LanguageAdmin)
 
@@ -252,10 +335,18 @@ class SkillInline(admin.TabularInline):
     extra = 1
 
 
+class UserMembershipAutocompleteForm(BaseGroupMembershipAutocompleteForm):
+
+    class Meta:
+        widgets = {
+            'group': autocomplete.ModelSelect2(url='groups:group-autocomplete'),
+        }
+
+
 class GroupMembershipInline(admin.TabularInline):
     model = GroupMembership
     extra = 1
-    form = autocomplete_light.modelform_factory(GroupMembership)
+    form = UserMembershipAutocompleteForm
 
 
 class LanguageInline(admin.TabularInline):
@@ -332,18 +423,25 @@ class UserProfileAdminForm(forms.ModelForm):
 
     class Meta:
         model = UserProfile
+        fields = '__all__'
 
 
 class UserProfileResource(ModelResource):
     """django-import-export UserProfile Resource."""
     username = Field(attribute='user__username')
     email = Field(attribute='user__email')
+    country_name = Field(attribute='geo_country__name')
+    country_code = Field(attribute='geo_country__code')
+    region_name = Field(attribute='geo_region__name')
+    region_code = Field(attribute='geo_region__code')
+    city_name = Field(attribute='geo_city__name')
+    city_code = Field(attribute='geo_city__code')
 
     class Meta:
         model = UserProfile
 
 
-class UserProfileAdmin(AdminImageMixin, ExportMixin, admin.ModelAdmin):
+class UserProfileAdmin(AdminImageMixin, MozilliansAdminExportMixin, admin.ModelAdmin):
     resource_class = UserProfileResource
     inlines = [LanguageInline, GroupMembershipInline, ExternalAccountInline,
                AlternateEmailInline]
@@ -355,17 +453,20 @@ class UserProfileAdmin(AdminImageMixin, ExportMixin, admin.ModelAdmin):
     list_filter = ['is_vouched', 'can_vouch', DateJoinedFilter,
                    LastLoginFilter, LegacyVouchFilter, SuperUserFilter,
                    CompleteProfileFilter, PublicProfileFilter, AlternateEmailFilter,
-                   'externalaccount__type', 'referral_source']
+                   NDAMemberFilter, BasketTokenFilter, 'externalaccount__type', 'referral_source']
     save_on_top = True
     list_display = ['full_name', 'email', 'username', 'geo_country', 'is_vouched', 'can_vouch',
                     'number_of_vouchees']
     list_display_links = ['full_name', 'email', 'username']
-    actions = [subscribe_to_basket_action(), unsubscribe_from_basket_action(),
+    actions = [subscribe_to_basket_action(settings.BASKET_VOUCHED_NEWSLETTER),
+               unsubscribe_from_basket_action(settings.BASKET_VOUCHED_NEWSLETTER),
+               subscribe_to_basket_action(settings.BASKET_NDA_NEWSLETTER),
+               unsubscribe_from_basket_action(settings.BASKET_NDA_NEWSLETTER),
                update_vouch_flags_action()]
 
     fieldsets = (
         ('Account', {
-            'fields': ('full_name', 'username', 'email', 'photo',)
+            'fields': ('full_name', 'full_name_local', 'username', 'email', 'photo',)
         }),
         (None, {
             'fields': ('title', 'bio', 'tshirt', 'ircname', 'date_mozillian',)
@@ -384,8 +485,8 @@ class UserProfileAdmin(AdminImageMixin, ExportMixin, admin.ModelAdmin):
             'fields': ('allows_community_sites', 'allows_mozilla_sites')
         }),
         ('Privacy Settings', {
-            'fields': ('privacy_photo', 'privacy_full_name', 'privacy_ircname',
-                       'privacy_email', 'privacy_bio',
+            'fields': ('privacy_photo', 'privacy_full_name', 'privacy_full_name_local',
+                       'privacy_ircname', 'privacy_email', 'privacy_bio',
                        'privacy_geo_city', 'privacy_geo_region', 'privacy_geo_country',
                        'privacy_groups', 'privacy_skills', 'privacy_languages',
                        'privacy_date_mozillian', 'privacy_timezone',
@@ -404,9 +505,9 @@ class UserProfileAdmin(AdminImageMixin, ExportMixin, admin.ModelAdmin):
         }),
     )
 
-    def queryset(self, request):
-        qs = super(UserProfileAdmin, self).queryset(request)
-        qs = qs.annotate(Count('vouches_made'))
+    def get_queryset(self, request):
+        qs = super(UserProfileAdmin, self).get_queryset(request)
+        qs = qs.annotate(vouches_made_count=Count('vouches_made'))
         return qs
 
     def email(self, obj):
@@ -432,8 +533,8 @@ class UserProfileAdmin(AdminImageMixin, ExportMixin, admin.ModelAdmin):
 
     def number_of_vouchees(self, obj):
         """Return the number of vouchees for obj."""
-        return obj.vouches_made.count()
-    number_of_vouchees.admin_order_field = 'vouches_made__count'
+        return obj.vouches_made_count
+    number_of_vouchees.admin_order_field = 'vouches_made_count'
 
     def last_login(self, obj):
         return obj.user.last_login
@@ -455,7 +556,7 @@ class UserProfileAdmin(AdminImageMixin, ExportMixin, admin.ModelAdmin):
 
     def check_celery(self, request):
         try:
-            investigator = mozillians.users.tasks.check_celery.delay()
+            investigator = check_celery.delay()
         except socket_error as e:
             messages.error(request, 'Cannot connect to broker: %s' % e)
             return HttpResponseRedirect(reverse('admin:users_userprofile_changelist'))
@@ -464,10 +565,12 @@ class UserProfileAdmin(AdminImageMixin, ExportMixin, admin.ModelAdmin):
             investigator.get(timeout=5)
         except investigator.TimeoutError as e:
             messages.error(request, 'Worker timeout: %s' % e)
+        except Exception as e:
+            raise e
         else:
             messages.success(request, 'Celery is OK')
-        finally:
-            return HttpResponseRedirect(reverse('admin:users_userprofile_changelist'))
+
+        return HttpResponseRedirect(reverse('admin:users_userprofile_changelist'))
 
     def get_urls(self):
         """Return custom and UserProfileAdmin urls."""
@@ -512,28 +615,49 @@ admin.site.unregister(User)
 admin.site.register(User, UserAdmin)
 
 
-class GroupAdmin(ExportMixin, GroupAdmin):
+class GroupAdmin(MozilliansAdminExportMixin, GroupAdmin):
     pass
 
 admin.site.register(Group, GroupAdmin)
 
 
-class VouchAdminForm(forms.ModelForm):
+class VouchAutocompleteForm(forms.ModelForm):
 
     class Meta:
         model = Vouch
+        fields = '__all__'
         widgets = {
-            'voucher': autocomplete_light.ChoiceWidget('UserProfiles'),
-            'vouchee': autocomplete_light.ChoiceWidget('UserProfiles'),
+            'vouchee': autocomplete.ModelSelect2(url='users:vouchee-autocomplete'),
+            'voucher': autocomplete.ModelSelect2(url='users:voucher-autocomplete')
         }
 
 
 class VouchAdmin(admin.ModelAdmin):
     save_on_top = True
     search_fields = ['voucher__user__username', 'voucher__full_name',
-                     'vouchee__user__username', 'vouchee__full_name']
+                     'vouchee__user__username', 'vouchee__full_name',
+                     'voucher__user__email', 'vouchee__user__email']
     list_display = ['vouchee', 'voucher', 'date', 'autovouch']
     list_filter = ['autovouch']
-    form = VouchAdminForm
+    form = VouchAutocompleteForm
 
 admin.site.register(Vouch, VouchAdmin)
+
+
+class AbuseReportAutocompleteForm(forms.ModelForm):
+
+    class Meta:
+        model = AbuseReport
+        fields = '__all__'
+        widgets = {
+            'profile': autocomplete.ModelSelect2(url='users:vouchee-autocomplete'),
+            'reporter': autocomplete.ModelSelect2(url='users:vouchee-autocomplete'),
+        }
+
+
+class AbuseReportAdmin(admin.ModelAdmin):
+    form = AbuseReportAutocompleteForm
+    list_display = ['profile', 'reporter', 'type', 'created', 'updated']
+    list_filter = ['type', 'is_akismet']
+
+admin.site.register(AbuseReport, AbuseReportAdmin)

@@ -8,9 +8,9 @@ import sys
 
 from django.utils.functional import lazy
 
-import djcelery
-from urlparse import urljoin
+from django_jinja.builtins import DEFAULT_EXTENSIONS
 from django_sha2 import get_password_hashers
+from urlparse import urljoin
 
 
 PROJECT_MODULE = 'mozillians'
@@ -18,7 +18,6 @@ ROOT_URLCONF = '%s.urls' % PROJECT_MODULE
 
 DEV = False
 DEBUG = False
-TEMPLATE_DEBUG = DEBUG
 
 ADMINS = ()
 MANAGERS = ADMINS
@@ -43,7 +42,7 @@ LOGGING = {
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 
 # path() bases things off of ROOT
-path = lambda *a: os.path.abspath(os.path.join(ROOT, *a))
+path = lambda *a: os.path.abspath(os.path.join(ROOT, *a))  # noqa
 
 # Database settings
 DATABASES = {
@@ -68,24 +67,23 @@ SLAVE_DATABASES = []
 TIME_ZONE = 'America/Los_Angeles'
 USE_I18N = True
 USE_L10N = True
-TEXT_DOMAIN = 'messages'
-STANDALONE_DOMAINS = [TEXT_DOMAIN, 'javascript']
-TOWER_KEYWORDS = {'_lazy': None}
-TOWER_ADD_HEADERS = True
+TEXT_DOMAIN = 'django'
+STANDALONE_DOMAINS = [TEXT_DOMAIN, 'djangojs']
 LANGUAGE_CODE = 'en-US'
 LOCALE_PATHS = [path('locale')]
 
 # Tells the extract script what files to parse for strings and what functions to use.
-DOMAIN_METHODS = {
-    'messages': [
-        ('mozillians/**.py',
-            'tower.management.commands.extract.extract_tower_python'),
-        ('mozillians/**/templates/**.html',
-            'tower.management.commands.extract.extract_tower_template'),
-        ('templates/**.html',
-            'tower.management.commands.extract.extract_tower_template'),
-    ],
+PUENTE = {
+    'BASE_DIR': ROOT,
+    'DOMAIN_METHODS': {
+        'django': [
+            ('mozillians/**.py', 'python'),
+            ('mozillians/**/templates/**.html', 'django'),
+            ('mozillians/**/jinja2/**.html', 'jinja2')
+        ]
+    }
 }
+
 
 # Tells the product_details module where to find our local JSON files.
 # This ultimately controls how LANGUAGES are constructed.
@@ -95,7 +93,7 @@ PROD_DETAILS_DIR = path('lib/product_details_json')
 LANGUAGE_CODE = 'en-US'
 PROD_LANGUAGES = ('ca', 'cs', 'de', 'en-US', 'en-GB', 'es', 'hu', 'fr', 'it', 'ko',
                   'nl', 'pl', 'pt-BR', 'pt-PT', 'ro', 'ru', 'sk', 'sl', 'sq', 'sr',
-                  'sv-SE', 'zh-TW', 'zh-CN', 'lt', 'ja', 'hsb', 'dsb', 'uk',)
+                  'sv-SE', 'te', 'zh-TW', 'zh-CN', 'lt', 'ja', 'hsb', 'dsb', 'uk', 'kab',)
 DEV_LANGUAGES = PROD_LANGUAGES
 CANONICAL_LOCALES = {
     'en': 'en-US',
@@ -105,21 +103,17 @@ CANONICAL_LOCALES = {
 RTL_LANGUAGES = ()  # ('ar', 'fa', 'fa-IR', 'he')
 
 
-def lazy_lang_url_map():
-    from django.conf import settings
-    langs = settings.DEV_LANGUAGES if settings.DEV else settings.PROD_LANGUAGES
-    return dict([(i.lower(), i) for i in langs])
+def get_langs():
+    return DEV_LANGUAGES if DEV else PROD_LANGUAGES
 
-LANGUAGE_URL_MAP = lazy(lazy_lang_url_map, dict)()
+LANGUAGE_URL_MAP = dict([(i.lower(), i) for i in get_langs()])
 
 
-# Override Django's built-in with our native names
 def lazy_langs():
-    from django.conf import settings
     from product_details import product_details
-    langs = DEV_LANGUAGES if settings.DEV else settings.PROD_LANGUAGES
+
     return dict([(lang.lower(), product_details.languages[lang]['native'])
-                 for lang in langs if lang in product_details.languages])
+                 for lang in get_langs() if lang in product_details.languages])
 
 LANGUAGES = lazy(lazy_langs, dict)()
 
@@ -134,29 +128,63 @@ PORT = 443
 
 # Templates.
 # List of callables that know how to import templates from various sources.
-TEMPLATE_LOADERS = (
-    'jingo.Loader',
-    'django.template.loaders.filesystem.Loader',
-    'django.template.loaders.app_directories.Loader',
-    # 'django.template.loaders.eggs.Loader',
-)
 
-TEMPLATE_CONTEXT_PROCESSORS = (
+COMMON_CONTEXT_PROCESSORS = [
     'django.contrib.auth.context_processors.auth',
-    'django.core.context_processors.debug',
-    'django.core.context_processors.media',
-    'django.core.context_processors.request',
-    'session_csrf.context_processor',
+    'django.template.context_processors.debug',
+    'django.template.context_processors.media',
+    'django.template.context_processors.request',
+    'django.template.context_processors.static',
+    'django.template.context_processors.tz',
     'django.contrib.messages.context_processors.messages',
+    'session_csrf.context_processor',
     'mozillians.common.context_processors.i18n',
     'mozillians.common.context_processors.globals',
     'mozillians.common.context_processors.current_year',
-    'mozillians.common.context_processors.canonical_path'
-)
+    'mozillians.common.context_processors.canonical_path',
+]
 
-TEMPLATE_DIRS = (
-    path('mozillians/templates'),
-)
+TEMPLATES = [
+    {
+        'BACKEND': 'django_jinja.backend.Jinja2',
+        'DIRS': [path('mozillians/jinja2')],
+        'NAME': 'jinja2',
+        'APP_DIRS': True,
+        'OPTIONS': {
+            'debug': DEBUG,
+            'app_dirname': 'jinja2',
+            'match_extension': None,
+            'newstyle_gettext': True,
+            'undefined': 'jinja2.Undefined',
+            'extensions': DEFAULT_EXTENSIONS + [
+                'compressor.contrib.jinja2ext.CompressorExtension',
+                'waffle.jinja.WaffleExtension',
+                'puente.ext.i18n',
+            ],
+            'globals': {
+                'browserid_info': 'django_browserid.helpers.browserid_info',
+                'browserid_login': 'django_browserid.helpers.browserid_login',
+                'browserid_logout': 'django_browserid.helpers.browserid_logout',
+                'browserid_js': 'django_browserid.helpers.browserid_js'
+            },
+            'context_processors': COMMON_CONTEXT_PROCESSORS
+        }
+    },
+    {
+        'BACKEND': 'django.template.backends.django.DjangoTemplates',
+        'DIRS': [path('mozillians/templates')],
+        'APP_DIRS': True,
+        'OPTIONS': {
+            'debug': DEBUG,
+            'context_processors': COMMON_CONTEXT_PROCESSORS
+        }
+    }
+]
+
+
+def COMPRESS_JINJA2_GET_ENVIRONMENT():
+    from django.template import engines
+    return engines['jinja2'].env
 
 # Absolute path to the directory that holds media.
 MEDIA_ROOT = path('media')
@@ -186,34 +214,6 @@ STATICFILES_FINDERS = (
     'compressor.finders.CompressorFinder',
 )
 
-JINGO_EXCLUDE_APPS = [
-    'admin',
-    'autocomplete_light',
-    'browserid',
-    'registration',
-    'rest_framework',
-]
-
-
-def JINJA_CONFIG():
-    config = {
-        'extensions': [
-            'tower.template.i18n',
-            'jinja2.ext.do',
-            'jinja2.ext.with_',
-            'jinja2.ext.loopcontrols',
-            'compressor.contrib.jinja2ext.CompressorExtension'
-        ],
-        'finalize': lambda x: x if x is not None else ''
-    }
-    return config
-
-
-def COMPRESS_JINJA2_GET_ENVIRONMENT():
-    from jingo import env
-    return env
-
-
 MIDDLEWARE_CLASSES = (
     'mozillians.common.middleware.LocaleURLMiddleware',
     'multidb.middleware.PinningRouterMiddleware',
@@ -221,6 +221,7 @@ MIDDLEWARE_CLASSES = (
     'django.middleware.common.CommonMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'django.middleware.security.SecurityMiddleware',
 
     'session_csrf.CsrfMiddleware',  # Must be after auth middleware.
 
@@ -252,6 +253,10 @@ SESSION_COOKIE_SECURE = True
 # StrictTransport
 STS_SUBDOMAINS = True
 
+# Security middleware
+SECURE_CONTENT_TYPE_NOSNIFF = True
+SECURE_BROWSER_XSS_FILTER = True
+
 # Not all URLs need locale.
 SUPPORTED_NONLOCALES = [
     'media',
@@ -279,6 +284,9 @@ LOGIN_URL = '/'
 LOGIN_REDIRECT_URL = '/login/'
 
 INSTALLED_APPS = (
+    'dal',
+    'dal_select2',
+
     # Django contrib apps
     'django.contrib.auth',
     'django.contrib.contenttypes',
@@ -288,17 +296,17 @@ INSTALLED_APPS = (
     'django.contrib.admin',
 
     # Third-party apps, patches, fixes
+    'django_jinja',
+    'djcelery',
+    'puente',
     'compressor',
-    'tower',
     'cronjobs',
     'django_browserid',
     'commonware.response.cookies',
-    'djcelery',
     'django_nose',
     'session_csrf',
     'product_details',
     'csp',
-
     'mozillians',
     'mozillians.users',
     'mozillians.phonebook',
@@ -312,10 +320,10 @@ INSTALLED_APPS = (
     'mozillians.geo',
 
     'sorl.thumbnail',
-    'autocomplete_light',
     'import_export',
     'waffle',
     'rest_framework',
+    'raven.contrib.django.raven_compat',
 )
 
 # Auth
@@ -360,46 +368,61 @@ AUTO_VOUCH_DOMAINS = ('mozilla.com', 'mozilla.org', 'mozillafoundation.org')
 AUTO_VOUCH_REASON = 'An automatic vouch for being a Mozilla employee.'
 
 # Django-CSP
-CSP_DEFAULT_SRC = ("'self'",
-                   'http://*.mapbox.com',
-                   'https://*.mapbox.com')
-CSP_FONT_SRC = ("'self'",
-                'http://*.mozilla.net',
-                'https://*.mozilla.net',
-                'http://*.mozilla.org',
-                'https://*.mozilla.org',
-                'https://mozorg.cdn.mozilla.net',
-                'http://mozorg.cdn.mozilla.net')
-CSP_CHILD_SRC = ("'self'",
-                 'https://login.persona.org',)
-CSP_IMG_SRC = ("'self'",
-               'data:',
-               'http://*.mozilla.net',
-               'https://*.mozilla.net',
-               'http://*.mozilla.org',
-               'https://*.mozilla.org',
-               '*.google-analytics.com',
-               '*.gravatar.com',
-               '*.wp.com',
-               'http://*.mapbox.com',
-               'https://*.mapbox.com')
-CSP_SCRIPT_SRC = ("'self'",
-                  'http://www.mozilla.org',
-                  'https://www.mozilla.org',
-                  'http://*.mozilla.net',
-                  'https://*.mozilla.net',
-                  'https://*.google-analytics.com',
-                  'https://login.persona.org',
-                  'http://*.mapbox.com',
-                  'https://*.mapbox.com')
-CSP_STYLE_SRC = ("'self'",
-                 "'unsafe-inline'",
-                 'http://www.mozilla.org',
-                 'https://www.mozilla.org',
-                 'http://*.mozilla.net',
-                 'https://*.mozilla.net',
-                 'http://*.mapbox.com',
-                 'https://*.mapbox.com')
+CSP_REPORT_ONLY = False
+CSP_REPORT_ENABLE = True
+CSP_REPORT_URI = '/en-US/capture-csp-violation'
+CSP_DEFAULT_SRC = (
+    "'self'",
+    'https://*.mapbox.com',
+    'https://*.persona.org',
+    'https://www.google.com/recaptcha/',
+    'https://www.gstatic.com/recaptcha/',
+)
+CSP_FONT_SRC = (
+    "'self'",
+    'https://*.mozilla.net',
+    'https://*.mozilla.org',
+    'https://mozorg.cdn.mozilla.net',
+)
+CSP_CHILD_SRC = (
+    "'self'",
+    'https://login.persona.org',
+)
+CSP_IMG_SRC = (
+    "'self'",
+    'data:',
+    'https://*.mozilla.net',
+    'https://*.mozilla.org',
+    '*.google-analytics.com',
+    '*.gravatar.com',
+    '*.wp.com',
+    'https://*.mapbox.com',
+)
+CSP_SCRIPT_SRC = (
+    "'self'",
+    'https://www.mozilla.org',
+    'https://*.mozilla.net',
+    'https://*.google-analytics.com',
+    'https://login.persona.org',
+    'https://*.mapbox.com',
+    'https://www.google.com/recaptcha/',
+    'https://www.gstatic.com/recaptcha/',
+)
+CSP_STYLE_SRC = (
+    "'self'",
+    "'unsafe-inline'",
+    'https://www.mozilla.org',
+    'https://*.mozilla.net',
+    'https://*.mapbox.com',
+)
+CSP_CHILD_SRC = (
+    'https://www.google.com/recaptcha/',
+    'https://login.persona.org/communication_iframe',
+)
+CSP_FRAME_SRC = (
+    'https://www.google.com/recaptcha/',
+    'https://login.persona.org/communication_iframe',
+)
 
 # Elasticutils settings
 ES_DISABLED = True
@@ -422,14 +445,21 @@ if 'test' in sys.argv:
 else:
     # Basket requires SSL now for some calls
     BASKET_URL = 'https://basket.mozilla.com'
-BASKET_NEWSLETTER = 'mozilla-phone'
+
+BASKET_VOUCHED_NEWSLETTER = 'mozilla-phone'
+BASKET_NDA_NEWSLETTER = 'mozillians-nda'
+NDA_GROUP = "nda"
 
 USER_AVATAR_DIR = 'uploads/userprofile'
 MOZSPACE_PHOTO_DIR = 'uploads/mozspaces'
 ANNOUNCEMENTS_PHOTO_DIR = 'uploads/announcements'
+ADMIN_EXPORT_MIXIN = 'mozillians.common.mixins.S3ExportMixin'
 
 # Google Analytics
 GA_ACCOUNT_CODE = 'UA-35433268-19'
+
+# Akismet
+AKISMET_API_KEY = ''
 
 # Set ALLOWED_HOSTS based on SITE_URL.
 
@@ -455,22 +485,22 @@ DEFAULT_AVATAR_URL = urljoin(MEDIA_URL, DEFAULT_AVATAR)
 DEFAULT_AVATAR_PATH = os.path.join(MEDIA_ROOT, DEFAULT_AVATAR)
 
 # Celery configuration
-CELERYBEAT_SCHEDULER = 'djcelery.schedulers.DatabaseScheduler'
-
-# Django-celery setup
+import djcelery  # noqa
 djcelery.setup_loader()
+CELERYBEAT_SCHEDULER = 'djcelery.schedulers.DatabaseScheduler'
 
 # True says to simulate background tasks without actually using celeryd.
 # Good for local development in case celeryd is not running.
 CELERY_ALWAYS_EAGER = True
 BROKER_CONNECTION_TIMEOUT = 0.1
 CELERY_RESULT_BACKEND = 'amqp'
-CELERY_IGNORE_RESULT = True
-CELERY_EAGER_PROPAGATES_EXCEPTIONS = True
+CELERY_ACCEPT_CONTENT = ['pickle']
+CELERY_TASK_RESULT_EXPIRES = 3600
+CELERY_SEND_TASK_ERROR_EMAILS = True
 
 # Time in seconds before celery.exceptions.SoftTimeLimitExceeded is raised.
 # The task can catch that and recover but should exit ASAP.
-CELERYD_TASK_SOFT_TIME_LIMIT = 60 * 2
+CELERYD_TASK_SOFT_TIME_LIMIT = 150
 
 MESSAGE_STORAGE = 'django.contrib.messages.storage.session.SessionStorage'
 
@@ -484,8 +514,13 @@ ITEMS_PER_PAGE = 24
 COMPRESS_OFFLINE = True
 COMPRESS_ENABLED = True
 
+# Use custom CSS, JS compressors to enable SRI support
+COMPRESS_CSS_COMPRESSOR = 'mozillians.common.compress.SRICssCompressor'
+COMPRESS_JS_COMPRESSOR = 'mozillians.common.compress.SRIJsCompressor'
+
+
 HUMANSTXT_GITHUB_REPO = 'https://api.github.com/repos/mozilla/mozillians/contributors'
-HUMANSTXT_LOCALE_REPO = 'https://svn.mozilla.org/projects/l10n-misc/trunk/mozillians/locales'
+HUMANSTXT_LOCALE_REPO = 'https://api.github.com/repos/mozilla-l10n/mozillians-l10n/contributors'
 HUMANSTXT_FILE = os.path.join(STATIC_ROOT, 'humans.txt')
 HUMANSTXT_URL = urljoin(STATIC_URL, 'humans.txt')
 
@@ -497,7 +532,7 @@ MAPBOX_PROFILE_ID = MAPBOX_MAP_ID
 
 def _browserid_request_args():
     from django.conf import settings
-    from tower import ugettext_lazy as _lazy
+    from django.utils.translation import ugettext_lazy as _lazy
 
     args = {
         'siteName': _lazy('Mozillians'),
@@ -544,3 +579,7 @@ TEST_RUNNER = 'django.test.runner.DiscoverRunner'
 
 # django-mobility
 MOBILE_COOKIE = 'mobile'
+
+# Recaptcha
+NORECAPTCHA_SITE_KEY = 'site_key'
+NORECAPTCHA_SECRET_KEY = 'secret_key'

@@ -1,17 +1,18 @@
 from django.core.exceptions import ValidationError
+from django.conf import settings
 from django.db import models
 from django.utils.timezone import now
+from django.utils.translation import ugettext as _
+from django.utils.translation import ugettext_lazy as _lazy
 
 from autoslug.fields import AutoSlugField
-from tower import ugettext as _
-from tower import ugettext_lazy as _lazy
 
 from mozillians.common.urlresolvers import reverse
 from mozillians.common.utils import absolutify
 from mozillians.groups.managers import GroupBaseManager, GroupQuerySet
-from mozillians.groups.helpers import slugify
+from mozillians.groups.templatetags.helpers import slugify
 from mozillians.groups.tasks import email_membership_change, member_removed_email
-from mozillians.users.tasks import update_basket_task
+from mozillians.users.tasks import unsubscribe_from_basket_task, subscribe_user_to_basket
 
 
 class GroupBase(models.Model):
@@ -24,6 +25,11 @@ class GroupBase(models.Model):
     class Meta:
         abstract = True
         ordering = ['name']
+
+    def get_absolute_url(self):
+        cls_name = self.__class__.__name__
+        url_pattern = 'groups:show_{0}'.format(cls_name.lower())
+        return absolutify(reverse(url_pattern, args=[self.url]))
 
     def clean(self):
         """Verify that name is unique in ALIAS_MODEL."""
@@ -170,9 +176,9 @@ class Group(GroupBase):
     members_can_leave = models.BooleanField(default=True)
     accepting_new_members = models.CharField(
         verbose_name=_lazy(u'Accepting new members'),
-        choices=(('yes', _lazy(u'Yes')),
-                 ('by_request', _lazy(u'By request')),
-                 ('no', _lazy(u'No')),),
+        choices=(('yes', _lazy(u'Open')),
+                 ('by_request', _lazy(u'Reviewed')),
+                 ('no', _lazy(u'Closed')),),
         default='yes',
         max_length=10
     )
@@ -199,6 +205,11 @@ class Group(GroupBase):
     terms = models.TextField(default='', verbose_name=_('Terms'), blank=True)
     invalidation_days = models.PositiveIntegerField(null=True, default=None, blank=True,
                                                     verbose_name=_('Invalidation days'))
+    invites = models.ManyToManyField('users.UserProfile', related_name='invites_received',
+                                     through='Invite', through_fields=('group', 'redeemer'))
+    invite_email_text = models.TextField(max_length=2048, default='', blank=True,
+                                         help_text=_('Please enter any additional text for the '
+                                                     'invitation email'))
     objects = GroupBaseManager.from_queryset(GroupQuerySet)()
 
     @classmethod
@@ -224,9 +235,6 @@ class Group(GroupBase):
     def search(cls, query):
         return super(Group, cls).search(query).visible()
 
-    def get_absolute_url(self):
-        return absolutify(reverse('groups:show_group', args=[self.url]))
-
     def merge_groups(self, group_list):
         for membership in GroupMembership.objects.filter(group__in=group_list):
             # add_member will never demote someone, so just add them with the current membership
@@ -246,39 +254,35 @@ class Group(GroupBase):
 
         If user is already in the group with a different status, their status will
         be updated if the change is a promotion. Otherwise, their status will not change.
+
+        If the group in question is the NDA group, also add the user to the NDA newsletter.
         """
         defaults = dict(status=status, date_joined=now())
         membership, created = GroupMembership.objects.get_or_create(userprofile=userprofile,
                                                                     group=self,
                                                                     defaults=defaults)
-        if created:
-            if status == GroupMembership.MEMBER:
-                # Joined
-                # Group is functional area, we want to sent this update to Basket
-                if self.functional_area:
-                    update_basket_task.delay(userprofile.id)
-        else:
-            if membership.status != status:
-                # Status changed
-                # The only valid status change states are:
-                # PENDING to MEMBER
-                # PENDING to PENDING_TERMS
-                # PENDING_TERMS to MEMBER
+        if membership.status != status:
+            # Status changed
+            # The only valid status change states are:
+            # PENDING to MEMBER
+            # PENDING to PENDING_TERMS
+            # PENDING_TERMS to MEMBER
 
-                old_status = membership.status
-                membership.status = status
-                statuses = [(GroupMembership.PENDING, GroupMembership.MEMBER),
-                            (GroupMembership.PENDING, GroupMembership.PENDING_TERMS),
-                            (GroupMembership.PENDING_TERMS, GroupMembership.MEMBER)]
-                if (old_status, status) in statuses:
-                    # Status changed
-                    membership.save()
-                    if membership.status in [GroupMembership.PENDING, GroupMembership.MEMBER]:
-                        if self.functional_area:
-                            # Group is functional area, we want to sent this update to Basket.
-                            update_basket_task.delay(userprofile.id)
-                        email_membership_change.delay(self.pk, userprofile.user.pk,
-                                                      old_status, status)
+            old_status = membership.status
+            membership.status = status
+            statuses = [(GroupMembership.PENDING, GroupMembership.MEMBER),
+                        (GroupMembership.PENDING, GroupMembership.PENDING_TERMS),
+                        (GroupMembership.PENDING_TERMS, GroupMembership.MEMBER)]
+            if (old_status, status) in statuses:
+                # Status changed
+                membership.save()
+                if membership.status in [GroupMembership.PENDING, GroupMembership.MEMBER]:
+                    email_membership_change.delay(self.pk, userprofile.user.pk, old_status, status)
+                # Since there is no demotion, we can check if the new status is MEMBER and
+                # subscribe the user to the NDA newsletter if the group is NDA
+                if self.name == settings.NDA_GROUP and status == GroupMembership.MEMBER:
+                    subscribe_user_to_basket.delay(userprofile.id,
+                                                   [settings.BASKET_NDA_NEWSLETTER])
 
     def remove_member(self, userprofile, send_email=True):
         try:
@@ -287,17 +291,22 @@ class Group(GroupBase):
             return
         old_status = membership.status
         membership.delete()
-        # If group is functional area, we want to sent this update to Basket
-        if self.functional_area:
-            update_basket_task.delay(userprofile.id)
 
         if old_status == GroupMembership.PENDING and send_email:
             # Request denied
-            email_membership_change.delay(self.pk, userprofile.user.pk,
-                                          old_status, None)
-        elif old_status == GroupMembership.MEMBER and send_email:
-            # Member removed
-            member_removed_email.delay(self.pk, userprofile.user.pk)
+            email_membership_change.delay(self.pk, userprofile.user.pk, old_status, None)
+        elif old_status == GroupMembership.MEMBER:
+            # If group is the NDA group, unsubscribe user from the newsletter.
+            if self.name == settings.NDA_GROUP:
+                unsubscribe_from_basket_task.delay(userprofile.email,
+                                                   [settings.BASKET_NDA_NEWSLETTER])
+
+            if send_email:
+                # Member removed
+                member_removed_email.delay(self.pk, userprofile.user.pk)
+
+        # delete the invitation to the group if exists
+        Invite.objects.filter(group=self, redeemer=userprofile).delete()
 
     def has_member(self, userprofile):
         """
@@ -330,3 +339,20 @@ class Skill(GroupBase):
         All users can remove a skill.
         """
         return True
+
+
+class Invite(models.Model):
+    inviter = models.ForeignKey('users.UserProfile', null=True, on_delete=models.SET_NULL,
+                                related_name='invite_sent', verbose_name=_lazy(u'Inviter'))
+    redeemer = models.ForeignKey('users.UserProfile', related_name='groups_invited',
+                                 verbose_name=_lazy(u'Redeemer'))
+    group = models.ForeignKey('Group')
+    accepted = models.BooleanField(default=False)
+    created = models.DateTimeField(auto_now_add=True)
+    updated = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ('group', 'redeemer')
+
+    def __unicode__(self):
+        return 'Invite #{}'.format(self.id)
